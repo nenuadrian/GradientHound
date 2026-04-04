@@ -1,14 +1,10 @@
-"""Generate a .ghound checkpoint from a simple CNN model."""
-import sys
-from pathlib import Path
+"""Demo: visualize a simple CNN with GradientHound hooks."""
+import time
 
 import torch
 import torch.nn as nn
 
-# Add collector to path for development
-sys.path.insert(0, str(Path(__file__).parent.parent / "collector" / "src"))
-
-from gradienthound_collector import GradientHoundCollector
+import gradienthound
 
 
 class SimpleCNN(nn.Module):
@@ -33,41 +29,52 @@ class SimpleCNN(nn.Module):
 
     def forward(self, x):
         x = self.features(x)
-        x = x.view(x.size(0), -1)
+        x = torch.flatten(x, 1)
         x = self.classifier(x)
         return x
 
 
 def main():
-    model = SimpleCNN(num_classes=10)
-    example_input = torch.randn(1, 3, 32, 32)
+    gradienthound.init(metadata={
+        "learning_rate": 0.001,
+        "epochs": 100,
+        "batch_size": 1,
+        "optimizer": "Adam",
+        "dataset": "synthetic",
+    })
 
+    model = SimpleCNN(num_classes=10)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-    # Simulate a training step
-    output = model(example_input)
-    loss = output.sum()
-    loss.backward()
-    optimizer.step()
+    gradienthound.register_model("SimpleCNN", model)
+    gradienthound.register_optimizer("Adam", optimizer)
 
-    collector = GradientHoundCollector(
-        model=model,
-        example_input=example_input,
-        model_name="SimpleCNN",
-    )
+    # Enable automatic gradient + weight capture via PyTorch hooks
+    gradienthound.watch(model, name="SimpleCNN")
 
-    out_dir = Path(__file__).parent.parent / "checkpoints"
-    out_path = out_dir / "simple_cnn.ghound"
+    example_input = torch.randn(1, 3, 32, 32)
+    target = torch.randint(0, 10, (1,))
+    criterion = nn.CrossEntropyLoss()
 
-    collector.save(
-        path=out_path,
-        optimizer=optimizer,
-        step=1,
-        epoch=1,
-        loss=loss.item(),
-    )
-    print(f"Checkpoint saved to {out_path}")
-    print(f"Graph has {len(collector.graph.nodes)} nodes and {len(collector.graph.edges)} edges")
+    print("Training... (open the GradientHound UI to inspect the model)")
+    try:
+        for epoch in range(100):
+            output = model(example_input)
+            loss = criterion(output, target)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Flush gradient stats + periodic weight snapshots to the dashboard
+            gradienthound.step()
+
+            print(f"  Epoch {epoch + 1}/100  loss={loss.item():.4f}")
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        gradienthound.shutdown()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 import torch
 import torch.nn as nn
@@ -24,7 +24,7 @@ class GradientHoundCollector:
     def __init__(
         self,
         model: nn.Module,
-        example_input: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        example_input: torch.Tensor | tuple[torch.Tensor, ...],
         model_name: str | None = None,
     ):
         self.model = model
@@ -33,7 +33,12 @@ class GradientHoundCollector:
     def save(
         self,
         path: str | Path,
-        optimizer: torch.optim.Optimizer | None = None,
+        optimizer: (
+            torch.optim.Optimizer
+            | Iterable[torch.optim.Optimizer]
+            | Mapping[str, torch.optim.Optimizer]
+            | None
+        ) = None,
         step: int | None = None,
         epoch: int | None = None,
         loss: float | None = None,
@@ -43,7 +48,8 @@ class GradientHoundCollector:
 
         Args:
             path: Output file path
-            optimizer: Optional optimizer to include state
+            optimizer: Optional optimizer(s) to include state. Accepts a single
+                optimizer, an iterable of optimizers, or a dict of named optimizers.
             step: Training step number
             epoch: Epoch number
             loss: Current loss value

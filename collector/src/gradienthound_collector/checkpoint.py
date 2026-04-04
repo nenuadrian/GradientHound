@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import io
 import json
+import re
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Mapping
 
 import torch
 import torch.nn as nn
@@ -14,11 +15,65 @@ from safetensors.torch import save
 from .types import ModelGraph
 
 
+OptimizerLike = (
+    torch.optim.Optimizer
+    | Iterable[torch.optim.Optimizer]
+    | Mapping[str, torch.optim.Optimizer]
+    | None
+)
+
+
+def _state_dict_to_safetensors_tensors(
+    state_dict: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    tensors: dict[str, torch.Tensor] = {}
+
+    for group_idx, group in enumerate(state_dict.get("param_groups", [])):
+        for key, val in group.items():
+            if isinstance(val, torch.Tensor):
+                tensors[f"group{group_idx}.{key}"] = val.contiguous()
+
+    for param_id, state in state_dict.get("state", {}).items():
+        for key, val in state.items():
+            if isinstance(val, torch.Tensor):
+                tensors[f"state.{param_id}.{key}"] = val.contiguous()
+
+    return tensors
+
+
+def _safe_optimizer_name(name: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9_.-]", "_", name).strip("._")
+    return clean or "optimizer"
+
+
+def _normalize_optimizers(optimizer: OptimizerLike) -> list[tuple[str, torch.optim.Optimizer]]:
+    if optimizer is None:
+        return []
+
+    if isinstance(optimizer, torch.optim.Optimizer):
+        return [("optimizer", optimizer)]
+
+    if isinstance(optimizer, Mapping):
+        out: list[tuple[str, torch.optim.Optimizer]] = []
+        for name, opt in optimizer.items():
+            if not isinstance(opt, torch.optim.Optimizer):
+                raise TypeError("All values in optimizer mapping must be torch.optim.Optimizer instances")
+            out.append((_safe_optimizer_name(name), opt))
+        return out
+
+    out = []
+    for idx, opt in enumerate(optimizer):
+        if not isinstance(opt, torch.optim.Optimizer):
+            raise TypeError("All items in optimizer iterable must be torch.optim.Optimizer instances")
+        out.append((f"optimizer_{idx}", opt))
+    return out
+
+
 def write_checkpoint(
     path: str | Path,
     graph: ModelGraph,
     model: nn.Module,
-    optimizer: torch.optim.Optimizer | None = None,
+    optimizer: OptimizerLike = None,
     metadata: dict[str, Any] | None = None,
     step: int | None = None,
     epoch: int | None = None,
@@ -30,7 +85,8 @@ def write_checkpoint(
         path: Output file path (should end with .ghound)
         graph: Extracted model graph
         model: The PyTorch model (for state_dict)
-        optimizer: Optional optimizer (for optimizer state)
+        optimizer: Optional optimizer(s) to include state. Accepts a single optimizer,
+            an iterable of optimizers, or a dict of named optimizers.
         metadata: Optional custom metadata dict
         step: Optional training step number
         epoch: Optional epoch number
@@ -71,20 +127,27 @@ def write_checkpoint(
         param_bytes = save(clean_state)
         zf.writestr("parameters/params.safetensors", param_bytes)
 
-        # Optional optimizer state
-        if optimizer is not None:
-            opt_state = optimizer.state_dict()
-            opt_tensors = {}
-            for group_idx, group in enumerate(opt_state.get("param_groups", [])):
-                for key, val in group.items():
-                    if isinstance(val, torch.Tensor):
-                        opt_tensors[f"group{group_idx}.{key}"] = val.contiguous()
-            for param_id, state in opt_state.get("state", {}).items():
-                for key, val in state.items():
-                    if isinstance(val, torch.Tensor):
-                        opt_tensors[f"state.{param_id}.{key}"] = val.contiguous()
-            if opt_tensors:
-                opt_bytes = save(opt_tensors)
+        # Optional optimizer state(s)
+        normalized_optimizers = _normalize_optimizers(optimizer)
+        used_names: set[str] = set()
+        for base_name, opt in normalized_optimizers:
+            file_stem = _safe_optimizer_name(base_name)
+            if file_stem in used_names:
+                suffix = 1
+                while f"{file_stem}_{suffix}" in used_names:
+                    suffix += 1
+                file_stem = f"{file_stem}_{suffix}"
+            used_names.add(file_stem)
+
+            opt_tensors = _state_dict_to_safetensors_tensors(opt.state_dict())
+            if not opt_tensors:
+                continue
+
+            opt_bytes = save(opt_tensors)
+            if len(normalized_optimizers) == 1 and file_stem in {"optimizer", "optimizer_0"}:
+                # Keep legacy path for single-optimizer checkpoints.
                 zf.writestr("optimizer/optimizer.safetensors", opt_bytes)
+            else:
+                zf.writestr(f"optimizer/{file_stem}.safetensors", opt_bytes)
 
     return path

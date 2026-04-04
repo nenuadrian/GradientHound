@@ -1,22 +1,16 @@
-.PHONY: dev-backend dev-frontend dev test-collector test-backend test example
+.PHONY: install test lint example clean
 
-dev-backend:
-	cd backend && uv run uvicorn gradienthound_server.main:app --reload --port 8642
-
-dev-frontend:
-	cd frontend && pnpm dev
-
-dev:
-	$(MAKE) dev-backend & $(MAKE) dev-frontend
-
-test-collector:
-	cd collector && uv run pytest
-
-test-backend:
-	cd backend && uv run pytest
+install:
+	uv pip install -e ".[dev,torch]"
 
 test:
-	$(MAKE) test-collector && $(MAKE) test-backend
+	uv run pytest tests/
+
+lint:
+	uv run ruff check src/
 
 example:
-	cd collector && uv run python ../examples/simple_cnn.py
+	uv run python examples/simple_cnn.py
+
+clean:
+	rm -rf build/ dist/ *.egg-info src/*.egg-info
