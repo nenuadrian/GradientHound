@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 class IPCChannel:
-    """File-based IPC between the main process and the Panel subprocess."""
+    """File-based IPC between training capture and dashboard consumers."""
 
     def __init__(self, directory: Path | str | None = None) -> None:
         if directory is None:

@@ -29,15 +29,13 @@ def _get_run() -> GradientHound | None:
 
 
 def init(
-    ui: bool = True,
-    port: int | None = None,
     metadata: dict | None = None,
 ) -> GradientHound:
     """Initialize GradientHound (wandb-style entry point)."""
     global _run
     if _run is not None:
         _run.shutdown()
-    _run = GradientHound(ui=ui, port=port, metadata=metadata)
+    _run = GradientHound(metadata=metadata)
     return _run
 
 

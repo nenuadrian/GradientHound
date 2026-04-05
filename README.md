@@ -4,19 +4,19 @@
     <img src="https://github.com/nenuadrian/GradientHound/blob/main/docs/assets/logo.png?raw=true" alt="logo" />
 </p>
 
-Hook into PyTorch training to visualize and inspect model architectures, gradients, weights, and optimizer state — live or offline.
+Hook into PyTorch training to capture and inspect model architectures, gradients, weights, and optimizer state.
 
 ## Install
 
 ```bash
-pip install gradienthound            # core (live UI via Panel)
+pip install gradienthound            # core training capture + model export
 pip install gradienthound[torch]     # + PyTorch integration
 pip install gradienthound[dash]      # + standalone Dash dashboard
 ```
 
-## Live training UI
+## Live training capture
 
-GradientHound provides a wandb-style API that hooks into your training loop and opens a real-time dashboard.
+GradientHound provides a wandb-style API that hooks into your training loop and captures rich telemetry.
 
 ### Quick start
 
@@ -31,8 +31,8 @@ model = nn.Sequential(
 )
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-# Initialize and open the dashboard in your browser
-gradienthound.init(ui=True, metadata={"lr": 1e-3, "batch_size": 32})
+# Initialize capture for this run
+gradienthound.init(metadata={"lr": 1e-3, "batch_size": 32})
 
 # Register model + optimizer for visualization
 gradienthound.register_model("mymodel", model)
@@ -58,7 +58,7 @@ gradienthound.shutdown()
 
 | Function | Description |
 |---|---|
-| `gradienthound.init(ui=True, port=None, metadata=None)` | Initialize a run. Set `ui=True` to launch the browser dashboard. |
+| `gradienthound.init(metadata=None)` | Initialize a run and start telemetry capture. |
 | `gradienthound.register_model(name, model)` | Register an `nn.Module` for architecture visualization. |
 | `gradienthound.register_optimizer(name, optimizer)` | Register an optimizer for state inspection. |
 | `gradienthound.watch(model, name, log_gradients=True, log_activations=False, weight_every=50)` | Attach PyTorch hooks for automatic gradient/activation capture. |
@@ -67,7 +67,7 @@ gradienthound.shutdown()
 | `gradienthound.log_attention(name, weights)` | Log an attention weight matrix for heatmap visualization. |
 | `gradienthound.log_predictions(predicted, actual, name="default")` | Log predicted vs actual values for calibration plots. |
 | `gradienthound.capture_wandb()` | Monkey-patch `wandb.log()` to also capture scalars in GradientHound. |
-| `gradienthound.shutdown()` | Stop the dashboard and clean up hooks. |
+| `gradienthound.shutdown()` | Clean up hooks and close the active capture run. |
 
 ### Dashboard pages
 
@@ -84,10 +84,10 @@ The live UI provides eight pages, each auto-refreshing during training:
 
 ### Integration patterns
 
-**Minimal (headless, no UI):**
+**Minimal:**
 
 ```python
-gh = gradienthound.init(ui=False)
+gh = gradienthound.init()
 gradienthound.register_model("net", model)
 gradienthound.watch(model, "net")
 # ... train ...
@@ -100,7 +100,7 @@ gradienthound.step()
 import wandb
 wandb.init(project="my-project")
 
-gradienthound.init(ui=True)
+gradienthound.init()
 gradienthound.capture_wandb()  # auto-captures wandb.log() scalars
 ```
 

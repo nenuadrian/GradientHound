@@ -44,7 +44,7 @@ def main():
     target = torch.randint(0, 10, (4,))
     criterion = nn.CrossEntropyLoss()
 
-    print("Training... (open the GradientHound UI to see live metrics)")
+    print("Training... (metrics are captured for dashboard analysis)")
     try:
         for epoch in range(200):
             optimizer.zero_grad()

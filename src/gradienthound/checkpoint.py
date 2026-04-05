@@ -23,6 +23,222 @@ if TYPE_CHECKING:
     import torch.nn as nn
 
 _HIST_BINS = 80
+_DEFAULT_SUBSPACE_TOP_K = 8
+_RANK_COLLAPSE_RATIO_THRESHOLD = 0.6
+_KURTOSIS_SPIKE_THRESHOLD = 2.0
+_NORM_OUTLIER_Z_THRESHOLD = 2.5
+
+# Known optimizer state buffer keys (used for detection & type inference)
+_ADAM_BUFFERS = {"exp_avg", "exp_avg_sq"}
+_SGD_BUFFERS = {"momentum_buffer"}
+_RMSPROP_BUFFERS = {"square_avg"}
+_ADADELTA_BUFFERS = {"square_avg", "acc_delta"}
+_ALL_OPT_BUFFERS = (
+    _ADAM_BUFFERS | _SGD_BUFFERS | _RMSPROP_BUFFERS | _ADADELTA_BUFFERS | {"step", "max_exp_avg_sq", "grad_avg"}
+)
+
+
+# ── Optimizer state detection ──────────────────────────────────────────
+
+
+def is_optimizer_state_dict(obj: Any) -> bool:
+    """Return ``True`` if *obj* looks like a PyTorch optimizer ``state_dict()``.
+
+    Detection is structural — we look for the ``state`` / ``param_groups``
+    layout produced by :meth:`torch.optim.Optimizer.state_dict`, not at key
+    names in the parent checkpoint.
+    """
+    if not isinstance(obj, dict):
+        return False
+
+    state = obj.get("state")
+    param_groups = obj.get("param_groups")
+
+    # Must have both top-level keys
+    if not isinstance(state, dict) or not isinstance(param_groups, list):
+        return False
+
+    # param_groups entries must look like optimizer groups
+    if not param_groups:
+        return False
+    for pg in param_groups:
+        if not isinstance(pg, dict):
+            return False
+        if "params" not in pg:
+            return False
+
+    # state keys are integer param indices (may be int or str-of-int)
+    if state:
+        sample_key = next(iter(state))
+        if not isinstance(sample_key, int):
+            try:
+                int(sample_key)
+            except (ValueError, TypeError):
+                return False
+        # At least one entry should contain known buffer keys
+        for s in state.values():
+            if isinstance(s, dict) and (set(s.keys()) & _ALL_OPT_BUFFERS):
+                return True
+        # Even without buffers (step 0, empty state), the structure is enough
+        return True
+
+    # Empty state (before first optimizer step) — structure is still valid
+    return True
+
+
+def extract_optimizer_states(raw: dict) -> dict[str, dict]:
+    """Scan a raw checkpoint dict and return all optimizer state dicts found.
+
+    Returns ``{key_name: optimizer_state_dict}`` for each top-level value that
+    passes :func:`is_optimizer_state_dict`.
+    """
+    found: dict[str, dict] = {}
+    for key, val in raw.items():
+        if is_optimizer_state_dict(val):
+            found[key] = val
+    return found
+
+
+def _infer_optimizer_type(opt_sd: dict) -> str:
+    """Heuristically infer the optimizer type from its state dict."""
+    state = opt_sd.get("state", {})
+    pg0 = (opt_sd.get("param_groups") or [{}])[0]
+
+    # Collect all buffer keys across state entries
+    all_keys: set[str] = set()
+    for s in state.values():
+        if isinstance(s, dict):
+            all_keys.update(s.keys())
+
+    if "acc_delta" in all_keys:
+        return "Adadelta"
+    if "exp_avg" in all_keys and "exp_avg_sq" in all_keys:
+        # Distinguish Adam variants by param_group keys
+        if pg0.get("amsgrad"):
+            return "Adam (amsgrad)"
+        if "decoupled_weight_decay" in pg0 or "weight_decay" in pg0:
+            # AdamW typically appears with weight_decay > 0 but we can't be sure
+            pass
+        return "Adam-family"
+    if "square_avg" in all_keys:
+        return "RMSprop"
+    if "momentum_buffer" in all_keys:
+        return "SGD (momentum)"
+    if "betas" in pg0:
+        return "Adam-family"
+    if pg0.get("momentum", 0) > 0:
+        return "SGD (momentum)"
+
+    return "Unknown"
+
+
+def compute_optimizer_stats(name: str, opt_sd: dict) -> dict[str, Any]:
+    """Compute aggregate statistics from a single optimizer state dict.
+
+    Returns a dict with type, hyperparameters, per-group state stats, and
+    memory estimates.
+    """
+    import torch
+
+    opt_type = _infer_optimizer_type(opt_sd)
+    state = opt_sd.get("state", {})
+    param_groups = opt_sd.get("param_groups", [])
+
+    # ── Per-group hyperparameters ────────────────────────────────────
+    groups_info: list[dict[str, Any]] = []
+    for i, pg in enumerate(param_groups):
+        info: dict[str, Any] = {"group_index": i}
+        for k, v in pg.items():
+            if k == "params":
+                info["num_params"] = len(v)
+                info["param_indices"] = v
+            elif isinstance(v, (int, float, bool, str)):
+                info[k] = v
+            elif isinstance(v, (list, tuple)) and all(isinstance(x, (int, float)) for x in v):
+                info[k] = list(v)
+        groups_info.append(info)
+
+    # ── Map param indices → group index ──────────────────────────────
+    param_to_group: dict[int, int] = {}
+    for gi, pg in enumerate(param_groups):
+        for pid in pg.get("params", []):
+            p_int = int(pid) if not isinstance(pid, int) else pid
+            param_to_group[p_int] = gi
+
+    # ── Per-group state buffer statistics ────────────────────────────
+    n_groups = len(param_groups)
+    group_exp_avg_norms: list[list[float]] = [[] for _ in range(n_groups)]
+    group_exp_avg_sq_means: list[list[float]] = [[] for _ in range(n_groups)]
+    group_momentum_norms: list[list[float]] = [[] for _ in range(n_groups)]
+    group_steps: list[int] = [0] * n_groups
+    total_state_numel = 0
+    total_state_bytes = 0
+    n_state_tensors = 0
+
+    for pid, s in state.items():
+        if not isinstance(s, dict):
+            continue
+        p_int = int(pid) if not isinstance(pid, int) else pid
+        gi = param_to_group.get(p_int, 0)
+
+        for buf_key, buf_val in s.items():
+            if buf_key == "step":
+                # step may be a scalar tensor or a plain int/float
+                step_val = int(buf_val.item()) if hasattr(buf_val, "item") else int(buf_val)
+                group_steps[gi] = max(group_steps[gi], step_val)
+            elif isinstance(buf_val, torch.Tensor):
+                numel = buf_val.numel()
+                total_state_numel += numel
+                total_state_bytes += numel * buf_val.element_size()
+                n_state_tensors += 1
+
+                if buf_key == "exp_avg":
+                    group_exp_avg_norms[gi].append(buf_val.norm(2).item())
+                elif buf_key == "exp_avg_sq":
+                    group_exp_avg_sq_means[gi].append(buf_val.mean().item())
+                elif buf_key == "momentum_buffer":
+                    group_momentum_norms[gi].append(buf_val.norm(2).item())
+
+    # ── Assemble per-group stats ─────────────────────────────────────
+    for gi, info in enumerate(groups_info):
+        info["step"] = group_steps[gi]
+
+        ea = group_exp_avg_norms[gi]
+        if ea:
+            info["exp_avg_norm_mean"] = sum(ea) / len(ea)
+            info["exp_avg_norm_max"] = max(ea)
+
+        esq = group_exp_avg_sq_means[gi]
+        if esq:
+            avg_v = sum(esq) / len(esq)
+            info["exp_avg_sq_mean"] = avg_v
+            eps = info.get("eps", 1e-8)
+            lr = info.get("lr", 0)
+            info["effective_lr"] = lr / (avg_v ** 0.5 + eps) if avg_v > 0 else lr
+
+            # Bias correction
+            betas = info.get("betas")
+            step = group_steps[gi]
+            if betas and step > 0 and isinstance(betas, (list, tuple)) and len(betas) == 2:
+                bc2 = 1 - betas[1] ** step
+                info["bias_correction2"] = bc2
+                import math
+                steps_to_converge = math.log(0.01) / math.log(betas[1]) if betas[1] < 1 else 1000
+                info["warmup_pct"] = min(100.0, round(step / steps_to_converge * 100, 1))
+
+        mn = group_momentum_norms[gi]
+        if mn:
+            info["momentum_norm_mean"] = sum(mn) / len(mn)
+            info["momentum_norm_max"] = max(mn)
+
+    return {
+        "name": name,
+        "type": opt_type,
+        "n_state_tensors": n_state_tensors,
+        "total_state_numel": total_state_numel,
+        "total_state_bytes": total_state_bytes,
+        "groups": groups_info,
+    }
 
 
 # ── Standalone stat computation ──────────────────────────────────────
@@ -119,6 +335,259 @@ def compute_tensor_stats(
         entries.append(entry)
 
     return entries
+
+
+def _linear_cka(a: Any, b: Any) -> float | None:
+    """Compute a linear CKA-style similarity score between two 2D tensors."""
+    import torch
+
+    if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+        return None
+    if a.ndim != 2 or b.ndim != 2:
+        return None
+
+    min_rows = min(a.shape[0], b.shape[0])
+    if min_rows <= 0:
+        return None
+
+    a_t = a[:min_rows].float()
+    b_t = b[:min_rows].float()
+
+    cross = (a_t.T @ b_t).pow(2).sum().item()
+    self_a = (a_t.T @ a_t).pow(2).sum().item()
+    self_b = (b_t.T @ b_t).pow(2).sum().item()
+    denom = max(math.sqrt(self_a * self_b), 1e-12)
+    return cross / denom
+
+
+def _subspace_overlap_topk(a: Any, b: Any, top_k: int) -> float | None:
+    """Compute overlap of right-singular top-k subspaces in [0, 1]."""
+    import torch
+
+    if not isinstance(a, torch.Tensor) or not isinstance(b, torch.Tensor):
+        return None
+    if a.ndim != 2 or b.ndim != 2:
+        return None
+    if a.shape[1] != b.shape[1]:
+        return None
+
+    max_k = min(a.shape[0], a.shape[1], b.shape[0], b.shape[1], int(top_k))
+    if max_k <= 0:
+        return None
+
+    try:
+        _, _, va_t = torch.linalg.svd(a.float(), full_matrices=False)
+        _, _, vb_t = torch.linalg.svd(b.float(), full_matrices=False)
+    except Exception:
+        return None
+
+    va = va_t[:max_k].T
+    vb = vb_t[:max_k].T
+    overlap = (va.T @ vb).pow(2).sum().item() / max_k
+    return max(0.0, min(1.0, overlap))
+
+
+def annotate_directional_drift(
+    snapshots: list[dict[str, Any]],
+    *,
+    subspace_top_k: int = _DEFAULT_SUBSPACE_TOP_K,
+    compute_cka: bool = False,
+) -> None:
+    """Annotate snapshot stats with checkpoint-to-checkpoint directional drift.
+
+    Adds the following keys on each layer entry for snapshots i >= 1:
+    - ``drift_cosine_prev``: cosine similarity of flattened weights.
+    - ``drift_subspace_overlap_prev``: top-k right-singular subspace overlap.
+    - ``drift_cka_prev`` (optional): linear CKA similarity for 2D weights.
+    """
+    import torch
+
+    if len(snapshots) < 2:
+        return
+
+    top_k = max(1, int(subspace_top_k))
+
+    for i in range(1, len(snapshots)):
+        prev_lookup = snapshots[i - 1].get("_tensor_lookup", {})
+        curr_lookup = snapshots[i].get("_tensor_lookup", {})
+        if not isinstance(prev_lookup, dict) or not isinstance(curr_lookup, dict):
+            continue
+
+        curr_entries = snapshots[i].get("weight_stats", [])
+        cosine_vals: list[float] = []
+        overlap_vals: list[float] = []
+        cka_vals: list[float] = []
+
+        for entry in curr_entries:
+            layer = entry.get("layer")
+            if not isinstance(layer, str):
+                continue
+            prev_t = prev_lookup.get(layer)
+            curr_t = curr_lookup.get(layer)
+            if not isinstance(prev_t, torch.Tensor) or not isinstance(curr_t, torch.Tensor):
+                continue
+
+            if prev_t.numel() == curr_t.numel() and prev_t.numel() > 0:
+                prev_flat = prev_t.detach().float().flatten()
+                curr_flat = curr_t.detach().float().flatten()
+                denom = max(prev_flat.norm().item() * curr_flat.norm().item(), 1e-12)
+                cosine = float(torch.dot(prev_flat, curr_flat).item() / denom)
+                entry["drift_cosine_prev"] = max(-1.0, min(1.0, cosine))
+                cosine_vals.append(entry["drift_cosine_prev"])
+
+            overlap = _subspace_overlap_topk(prev_t, curr_t, top_k)
+            if overlap is not None:
+                entry["drift_subspace_overlap_prev"] = overlap
+                overlap_vals.append(overlap)
+
+            if compute_cka:
+                cka_score = _linear_cka(prev_t, curr_t)
+                if cka_score is not None:
+                    entry["drift_cka_prev"] = cka_score
+                    cka_vals.append(cka_score)
+
+        summary: dict[str, Any] = {
+            "compared_to": snapshots[i - 1].get("name"),
+            "n_layers": len(curr_entries),
+            "n_cosine": len(cosine_vals),
+            "n_subspace": len(overlap_vals),
+        }
+        if cosine_vals:
+            summary["cosine_mean"] = sum(cosine_vals) / len(cosine_vals)
+        if overlap_vals:
+            summary["subspace_overlap_mean"] = sum(overlap_vals) / len(overlap_vals)
+        if compute_cka:
+            summary["n_cka"] = len(cka_vals)
+            if cka_vals:
+                summary["cka_mean"] = sum(cka_vals) / len(cka_vals)
+        snapshots[i]["drift_summary"] = summary
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    if n % 2 == 1:
+        return ordered[mid]
+    return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def annotate_checkpoint_events(snapshots: list[dict[str, Any]]) -> None:
+    """Detect and score suspicious checkpoint-to-checkpoint transitions.
+
+    Events are attached under each snapshot as ``anomalies`` for i >= 1.
+    """
+    if len(snapshots) < 2:
+        return
+
+    for i in range(1, len(snapshots)):
+        prev_snapshot = snapshots[i - 1]
+        curr_snapshot = snapshots[i]
+
+        prev_lookup = {s.get("layer"): s for s in prev_snapshot.get("weight_stats", [])}
+        curr_lookup = {s.get("layer"): s for s in curr_snapshot.get("weight_stats", [])}
+
+        # Collect relative norm changes for robust outlier detection.
+        rel_changes: list[float] = []
+        rel_change_by_layer: dict[str, float] = {}
+        for layer, curr in curr_lookup.items():
+            if not isinstance(layer, str):
+                continue
+            prev = prev_lookup.get(layer)
+            if not isinstance(prev, dict):
+                continue
+            prev_norm = prev.get("norm_l2")
+            curr_norm = curr.get("norm_l2")
+            if not isinstance(prev_norm, (int, float)) or not isinstance(curr_norm, (int, float)):
+                continue
+            if prev_norm <= 1e-12:
+                continue
+            rel = abs(curr_norm - prev_norm) / prev_norm
+            rel_changes.append(rel)
+            rel_change_by_layer[layer] = rel
+
+        med = _median(rel_changes)
+        mad = _median([abs(v - med) for v in rel_changes])
+        # Scale 1.4826 * MAD approximates standard deviation for normal data.
+        robust_sigma = max(1.4826 * mad, 1e-6)
+
+        anomalies: list[dict[str, Any]] = []
+
+        for layer, curr in curr_lookup.items():
+            if not isinstance(layer, str):
+                continue
+            prev = prev_lookup.get(layer)
+            if not isinstance(prev, dict):
+                continue
+
+            # 1) Effective-rank collapse
+            prev_rank = prev.get("effective_rank")
+            curr_rank = curr.get("effective_rank")
+            if isinstance(prev_rank, (int, float)) and isinstance(curr_rank, (int, float)) and prev_rank > 1e-6:
+                rank_ratio = curr_rank / prev_rank
+                if rank_ratio < _RANK_COLLAPSE_RATIO_THRESHOLD:
+                    severity = (1.0 - rank_ratio) * 100.0
+                    anomalies.append({
+                        "type": "rank_collapse",
+                        "layer": layer,
+                        "score": round(severity, 3),
+                        "current": curr_rank,
+                        "previous": prev_rank,
+                        "ratio": rank_ratio,
+                        "message": (
+                            f"Effective rank dropped from {prev_rank:.3g} to {curr_rank:.3g} "
+                            f"({rank_ratio * 100:.1f}% of previous)."
+                        ),
+                    })
+
+            # 2) Kurtosis spikes
+            prev_kurt = prev.get("kurtosis")
+            curr_kurt = curr.get("kurtosis")
+            if isinstance(prev_kurt, (int, float)) and isinstance(curr_kurt, (int, float)):
+                kurt_delta = abs(curr_kurt) - abs(prev_kurt)
+                if kurt_delta >= _KURTOSIS_SPIKE_THRESHOLD:
+                    severity = kurt_delta * 12.5
+                    anomalies.append({
+                        "type": "kurtosis_spike",
+                        "layer": layer,
+                        "score": round(severity, 3),
+                        "current": curr_kurt,
+                        "previous": prev_kurt,
+                        "delta_abs": kurt_delta,
+                        "message": (
+                            f"|kurtosis| increased by {kurt_delta:.3g} "
+                            f"(from {abs(prev_kurt):.3g} to {abs(curr_kurt):.3g})."
+                        ),
+                    })
+
+            # 3) Large norm-jump outliers per layer
+            rel = rel_change_by_layer.get(layer)
+            if rel is not None:
+                z = (rel - med) / robust_sigma
+                if z >= _NORM_OUTLIER_Z_THRESHOLD:
+                    severity = z * 10.0 + rel * 100.0
+                    anomalies.append({
+                        "type": "norm_jump_outlier",
+                        "layer": layer,
+                        "score": round(severity, 3),
+                        "relative_change": rel,
+                        "robust_z": z,
+                        "median_relative_change": med,
+                        "message": (
+                            f"Relative L2 norm change {rel * 100:.2f}% "
+                            f"(robust z={z:.2f} vs transition median {med * 100:.2f}%)."
+                        ),
+                    })
+
+        anomalies.sort(key=lambda a: a.get("score", 0.0), reverse=True)
+        curr_snapshot["anomalies"] = anomalies
+        curr_snapshot["anomaly_summary"] = {
+            "compared_to": prev_snapshot.get("name"),
+            "count": len(anomalies),
+            "top_score": anomalies[0]["score"] if anomalies else 0.0,
+        }
 
 
 # ── State dict detection ─────────────────────────────────────────────
@@ -230,6 +699,8 @@ def process_checkpoints(
     checkpoint_paths: list[str],
     *,
     loader_path: str | None = None,
+    compute_cka: bool = False,
+    subspace_top_k: int = _DEFAULT_SUBSPACE_TOP_K,
 ) -> list[dict[str, Any]]:
     """Load checkpoints and compute per-parameter weight statistics.
 
@@ -253,21 +724,55 @@ def process_checkpoints(
     for ckpt_path in checkpoint_paths:
         name = derive_checkpoint_name(ckpt_path)
 
+        opt_stats: list[dict[str, Any]] = []
+
         if loader_fn is not None:
             model = loader_fn(ckpt_path)
-            stats = compute_tensor_stats(model.named_parameters())
+            params = list(model.named_parameters())
+            stats = compute_tensor_stats(params)
+            tensor_lookup = {
+                name: tensor.detach().cpu()
+                for name, tensor in params
+                if isinstance(tensor, torch.Tensor)
+            }
         else:
             try:
                 raw = torch.load(ckpt_path, map_location="cpu", weights_only=True)
             except Exception:
                 raw = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             sd = extract_state_dict(raw)
-            stats = compute_tensor_stats(sd.items())
+            sd_items = list(sd.items())
+            stats = compute_tensor_stats(sd_items)
+            tensor_lookup = {
+                name: tensor.detach().cpu()
+                for name, tensor in sd_items
+                if isinstance(tensor, torch.Tensor)
+            }
+
+            # Detect and analyse optimizer states
+            if isinstance(raw, dict):
+                for opt_key, opt_sd in extract_optimizer_states(raw).items():
+                    try:
+                        opt_stats.append(compute_optimizer_stats(opt_key, opt_sd))
+                    except Exception:
+                        pass  # skip malformed optimizer data
 
         snapshots.append({
             "name": name,
             "path": ckpt_path,
             "weight_stats": stats,
+            "optimizer_states": opt_stats,
+            "_tensor_lookup": tensor_lookup,
         })
+
+    annotate_directional_drift(
+        snapshots,
+        subspace_top_k=subspace_top_k,
+        compute_cka=compute_cka,
+    )
+    annotate_checkpoint_events(snapshots)
+
+    for snapshot in snapshots:
+        snapshot.pop("_tensor_lookup", None)
 
     return snapshots

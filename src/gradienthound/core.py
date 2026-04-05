@@ -1,13 +1,7 @@
 from __future__ import annotations
 
 import atexit
-import os
-import socket
-import subprocess
-import sys
 import time
-import webbrowser
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .graph import extract_model_graph
@@ -22,16 +16,10 @@ if TYPE_CHECKING:
 
 class GradientHound:
     """Main entry point for GradientHound.
-
-    Args:
-        ui: If True, launch a Streamlit dashboard in the background.
-        port: Specific port for Streamlit. If None, picks a free port.
     """
 
     def __init__(
         self,
-        ui: bool = False,
-        port: int | None = None,
         metadata: dict | None = None,
     ) -> None:
         self._models: dict[str, dict] = {}
@@ -40,47 +28,13 @@ class GradientHound:
         self._watches: dict[str, WatchState] = {}
         self._metadata: dict = metadata or {}
         self._ipc = IPCChannel()
-        self._process: subprocess.Popen | None = None
-        self._ui = ui
         self._wandb_original_log: Any = None
         self._step: int = 0
         self._last_flushed_step: int | None = None
 
         self._ipc.write_metadata(self._metadata)
 
-        if ui:
-            self._start_ui(port)
-
         atexit.register(self.shutdown)
-
-    def _start_ui(self, port: int | None = None) -> None:
-        if port is None:
-            port = _find_free_port()
-
-        app_path = Path(__file__).parent / "_panel_app.py"
-
-        env = os.environ.copy()
-        env["GRADIENTHOUND_IPC_DIR"] = str(self._ipc.directory)
-
-        self._process = subprocess.Popen(
-            [
-                sys.executable, "-m", "panel", "serve",
-                str(app_path),
-                "--port", str(port),
-                "--allow-websocket-origin", f"localhost:{port}",
-                "--allow-websocket-origin", f"127.0.0.1:{port}",
-            ],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        url = f"http://localhost:{port}"
-        print(f"GradientHound UI: {url}")
-
-        # Give Panel a moment to start before opening the browser
-        time.sleep(1.5)
-        webbrowser.open_new_tab(url)
 
     def register_model(self, name: str, model: nn.Module) -> None:
         """Register a PyTorch model. The UI will display its architecture."""
@@ -332,21 +286,12 @@ class GradientHound:
             self._wandb_original_log = None
 
     def shutdown(self) -> None:
-        """Stop the Panel subprocess and clean up."""
+        """Clean up hooks, wandb patching, and IPC resources."""
         self._restore_wandb()
 
         for ws in self._watches.values():
             ws.remove_hooks()
         self._watches.clear()
-
-        if self._process is not None:
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-                self._process.wait(timeout=2)
-            self._process = None
 
         self._ipc.cleanup()
 
@@ -490,8 +435,3 @@ def _extract_optimizer_state_stats(
         "_timestamp": _time.time(),
     }
 
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]

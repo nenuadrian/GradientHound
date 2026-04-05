@@ -56,7 +56,7 @@ def main():
     target = torch.randint(0, 10, (1,))
     criterion = nn.CrossEntropyLoss()
 
-    print("Training... (open the GradientHound UI to inspect the model)")
+    print("Training... (use the standalone dashboard to inspect exported models/checkpoints)")
     try:
         for epoch in range(100):
             output = model(example_input)

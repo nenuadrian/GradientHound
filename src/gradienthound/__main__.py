@@ -30,18 +30,28 @@ def main() -> None:
         help="Path to a Python script defining load_checkpoint(path) -> nn.Module",
     )
     parser.add_argument(
+        "--wandb-entity", type=str, default=None,
+        help="Weights & Biases entity (team or username)",
+    )
+    parser.add_argument(
+        "--wandb-project-run-id", type=str, default=None,
+        help="Weights & Biases project/run_id, e.g. my-project/abc123",
+    )
+    parser.add_argument(
         "--debug", action="store_true",
         help="Run Dash in debug mode with hot-reload",
     )
     args = parser.parse_args()
 
-    from gradienthound._dash_app import create_app
+    from gradienthound._dashboard import create_app
 
     app = create_app(
         data_dir=args.data_dir,
         model_path=args.model,
         checkpoint_paths=args.checkpoints,
         loader_path=args.loader,
+        wandb_entity=args.wandb_entity,
+        wandb_project_run_id=args.wandb_project_run_id,
     )
     app.run(host="0.0.0.0", port=args.port, debug=args.debug)
 
