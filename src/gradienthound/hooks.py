@@ -268,6 +268,8 @@ class WatchState:
                     self._compute_weight_heatmap(req, step, req_id, ipc)
                 elif req_type == "cka":
                     self._compute_cka(step, req_id, ipc)
+                elif req_type == "network_state":
+                    self._compute_network_state(step, req_id, ipc)
             except Exception:
                 ipc.write_response(req_id, {"error": "computation failed"})
 
@@ -305,6 +307,48 @@ class WatchState:
             "display_shape": list(w.shape),
             "vmax": vmax,
             "sparsity": sparsity,
+        })
+
+    def _compute_network_state(self, step: int, req_id: str, ipc: IPCChannel) -> None:
+        """Dump all parameter values for models under 1M params."""
+        total_params = sum(p.numel() for p in self.model.parameters())
+        if total_params > 1_000_000:
+            ipc.write_response(req_id, {
+                "error": f"Model has {total_params:,} parameters (limit: 1,000,000)",
+            })
+            return
+
+        layers: list[dict[str, Any]] = []
+        for param_name, param in self.model.named_parameters():
+            data = param.data.detach().float().cpu()
+            shape = list(data.shape)
+            # For display: flatten >2D tensors to 2D
+            if data.ndim == 0:
+                values = [[round(data.item(), 6)]]
+            elif data.ndim == 1:
+                values = [[round(v, 6) for v in data.tolist()]]
+            elif data.ndim == 2:
+                values = [[round(v, 6) for v in row] for row in data.tolist()]
+            else:
+                # Reshape higher-dim to 2D: (product of leading dims, last dim)
+                flat2d = data.reshape(-1, data.shape[-1])
+                values = [[round(v, 6) for v in row] for row in flat2d.tolist()]
+
+            layers.append({
+                "name": param_name,
+                "shape": shape,
+                "numel": param.numel(),
+                "requires_grad": param.requires_grad,
+                "dtype": str(param.dtype),
+                "values": values,
+            })
+
+        ipc.write_response(req_id, {
+            "step": step,
+            "model": self.name,
+            "total_params": total_params,
+            "layers": layers,
+            "_timestamp": time.time(),
         })
 
     def _compute_cka(self, step: int, req_id: str, ipc: IPCChannel) -> None:

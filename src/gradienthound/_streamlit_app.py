@@ -31,10 +31,11 @@ _pages_dir = Path(__file__).parent / "pages"
 
 dashboard = st.Page(str(_pages_dir / "dashboard.py"), title="Dashboard", icon=":material/dashboard:", default=True)
 architecture = st.Page(str(_pages_dir / "architecture.py"), title="Architecture", icon=":material/account_tree:")
+network_state = st.Page(str(_pages_dir / "network_state.py"), title="Network State", icon=":material/table_chart:")
 weights = st.Page(str(_pages_dir / "weights.py"), title="Weights", icon=":material/analytics:")
 gradients = st.Page(str(_pages_dir / "gradients.py"), title="Gradients", icon=":material/trending_up:")
 training = st.Page(str(_pages_dir / "training.py"), title="Training", icon=":material/timeline:")
 optimizer_page = st.Page(str(_pages_dir / "optimizer.py"), title="Optimizers", icon=":material/tune:")
 
-nav = st.navigation([dashboard, architecture, weights, gradients, training, optimizer_page])
+nav = st.navigation([dashboard, architecture, network_state, weights, gradients, training, optimizer_page])
 nav.run()
