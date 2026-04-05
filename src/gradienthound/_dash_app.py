@@ -794,26 +794,46 @@ def create_app(
     }
     has_checkpoints = bool(ckpt_state["paths"])
 
-    # Sidebar
+    # Navbar
     nav_links = [
         dbc.NavLink(title, href=path, id=f"nav-{path}", active="exact")
         for path, (title, _) in _PAGES.items()
     ]
-    sidebar = dbc.Nav(nav_links, vertical=True, pills=True, className="flex-column pt-2")
+    navbar = dbc.Navbar(
+        dbc.Container([
+            dbc.NavbarBrand("GradientHound", href="/", className="fw-bold"),
+            dbc.NavbarToggler(id="navbar-toggler", n_clicks=0),
+            dbc.Collapse(
+                dbc.Nav(nav_links, className="ms-auto", navbar=True),
+                id="navbar-collapse",
+                is_open=False,
+                navbar=True,
+            ),
+        ], fluid=True),
+        color="dark",
+        dark=True,
+        sticky="top",
+        className="mb-3",
+    )
 
-    app.layout = dbc.Container([
+    app.layout = html.Div([
         dcc.Location(id="url", refresh=False),
         dcc.Store(id="ckpt-store", data=None),
-        dbc.Row([
-            dbc.Col([
-                html.H4("GradientHound", className="text-light mb-1 mt-3 px-3"),
-                html.Small("Inspect architecture, training dynamics, and optimizer health.",
-                           className="text-muted d-block px-3 mb-3"),
-                sidebar,
-            ], width=2, className="border-end min-vh-100 pt-0"),
-            dbc.Col(html.Div(id="gh-content"), width=10),
-        ]),
-    ], fluid=True)
+        navbar,
+        dbc.Container(html.Div(id="gh-content"), fluid=True, className="px-4"),
+    ])
+
+    # ── Navbar toggle (mobile) ──────────────────────────────────────
+
+    @callback(
+        Output("navbar-collapse", "is_open"),
+        Input("navbar-toggler", "n_clicks"),
+        State("navbar-collapse", "is_open"),
+    )
+    def _toggle_navbar(n_clicks, is_open):
+        if n_clicks:
+            return not is_open
+        return is_open
 
     # ── Process checkpoints ──────────────────────────────────────────
 

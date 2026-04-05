@@ -36,6 +36,7 @@ _CONTAINER_LABEL = "#5e4a4e"
 _CARD_BORDER = "#d0b4b8"
 _SEQUENTIAL_EDGE = "#8b5c64"
 _PARALLEL_EDGE = "#8a7a7c"
+_DETACHED_EDGE = "#9a8a8c"
 
 
 @dataclass(frozen=True)
@@ -153,6 +154,7 @@ def render_graphviz(
             "nodesep": "0.35",
             "ranksep": "0.65",
             "splines": "spline",
+            "newrank": "true",
         },
         node_attr={
             "fontname": "Helvetica",
@@ -210,7 +212,7 @@ def render_graphviz(
         )
         for child in root_children
     ]
-    _connect_root_children(dot, root_path, root, root_children, rendered_children)
+    _connect_root_children(dot, root_path, root, root_children, rendered_children, modules_by_path)
 
     return dot
 
@@ -259,7 +261,7 @@ def _render_module(
     visible_children = [c for c in mod.get("children", []) if c in visible_paths]
     overlay = overlays.get(path)
 
-    if not mod.get("is_container") or not visible_children:
+    if not visible_children:
         _add_module_node(
             parent=parent,
             path=path,
@@ -303,7 +305,7 @@ def _render_module(
             for child in visible_children
         ]
 
-    _connect_container_children(dot, mod, visible_children, rendered_children, entry_id, exit_id)
+    _connect_container_children(dot, mod, visible_children, rendered_children, entry_id, exit_id, modules_by_path)
     return _RenderEndpoints(entry_id=entry_id, exit_id=exit_id, cluster_id=cluster_id)
 
 
@@ -463,9 +465,9 @@ def _add_module_node(
 
 def _node_kind(mod: dict, children: list[str]) -> str:
     """Return a human-readable module kind for labeling."""
-    if mod.get("is_container"):
-        return "sequential" if _is_sequential_container(mod, children) else "parallel"
-    return "module"
+    if not children:
+        return "module"
+    return "sequential" if _is_sequential_container(mod, children) else "parallel"
 
 
 def _infer_node_io(
@@ -629,12 +631,63 @@ def _add_anchor_node(container: graphviz.Digraph, node_id: str) -> None:
     )
 
 
+def _is_standalone_module(mod: dict) -> bool:
+    """Detect utility modules not on the main data path.
+
+    Standalone modules are non-container leaves with no dimensional IO
+    attributes and zero learnable parameters (e.g. RunningNorm, Dropout).
+    """
+    if mod.get("children"):
+        return False
+    if mod.get("params", 0) > 0:
+        return False
+    attrs = mod.get("attributes", {})
+    return not any(
+        k in attrs
+        for k in ("in_features", "out_features", "in_channels", "out_channels",
+                   "num_embeddings", "embedding_dim", "num_features")
+    )
+
+
+def _partition_children(
+    children: list[str],
+    rendered_children: list[_RenderEndpoints],
+    modules_by_path: dict[str, dict],
+) -> tuple[list[tuple[str, _RenderEndpoints]], list[tuple[str, _RenderEndpoints]]]:
+    """Split (child_path, endpoints) pairs into (branches, standalone)."""
+    branches: list[tuple[str, _RenderEndpoints]] = []
+    standalone: list[tuple[str, _RenderEndpoints]] = []
+    for child_path, ep in zip(children, rendered_children):
+        mod = modules_by_path.get(child_path)
+        if mod is not None and _is_standalone_module(mod):
+            standalone.append((child_path, ep))
+        else:
+            branches.append((child_path, ep))
+    return branches, standalone
+
+
+def _add_fork_join_node(graph: graphviz.Digraph, node_id: str) -> None:
+    """Add a small filled circle used as a visual fork/join indicator."""
+    graph.node(
+        node_id,
+        label="",
+        shape="circle",
+        width="0.12",
+        height="0.12",
+        fixedsize="true",
+        style="filled",
+        fillcolor=_PARALLEL_EDGE,
+        color=_PARALLEL_EDGE,
+    )
+
+
 def _connect_root_children(
     dot: graphviz.Digraph,
     root_path: str,
     root: dict,
     root_children: list[str],
     rendered_children: list[_RenderEndpoints],
+    modules_by_path: dict[str, dict],
 ) -> None:
     """Connect the root summary card to its first-level modules."""
     if not root_children or not rendered_children:
@@ -646,8 +699,35 @@ def _connect_root_children(
             _connect_items(dot, left, right, color=_SEQUENTIAL_EDGE)
         return
 
-    for child in rendered_children:
-        _connect_node_to_item(dot, root_path, child, color=_PARALLEL_EDGE)
+    # Mixed / parallel layout: separate utility modules from data-flow branches.
+    branches, standalone = _partition_children(
+        root_children, rendered_children, modules_by_path,
+    )
+
+    if len(branches) >= 2:
+        # Visual fork/join for parallel branches.
+        fork_id = _anchor_id(root_path, "fork")
+        join_id = _anchor_id(root_path, "join")
+        _add_fork_join_node(dot, fork_id)
+        _add_fork_join_node(dot, join_id)
+        dot.edge(root_path, fork_id, color=_SEQUENTIAL_EDGE, arrowhead="none")
+        for _, ep in branches:
+            _connect_node_to_item(dot, fork_id, ep, color=_PARALLEL_EDGE)
+            _connect_item_to_node(dot, ep, join_id, color=_PARALLEL_EDGE)
+        # Same-rank hint for branch entries.
+        with dot.subgraph() as s:
+            s.attr(rank="same")
+            for _, ep in branches:
+                s.node(ep.entry_id)
+    elif branches:
+        _connect_node_to_item(dot, root_path, branches[0][1], color=_SEQUENTIAL_EDGE)
+
+    # Standalone / utility modules shown with dashed edges off to the side.
+    for _, ep in standalone:
+        dot.edge(
+            root_path, ep.entry_id,
+            style="dashed", color=_DETACHED_EDGE, arrowsize="0.5",
+        )
 
 
 def _connect_container_children(
@@ -657,6 +737,7 @@ def _connect_container_children(
     rendered_children: list[_RenderEndpoints],
     entry_id: str,
     exit_id: str,
+    modules_by_path: dict[str, dict],
 ) -> None:
     """Connect internal container flow using anchors and cluster-aware edges."""
     if not rendered_children:
@@ -669,9 +750,28 @@ def _connect_container_children(
         _connect_item_to_node(dot, rendered_children[-1], exit_id, color=_SEQUENTIAL_EDGE)
         return
 
-    for child in rendered_children:
-        _connect_node_to_item(dot, entry_id, child, color=_PARALLEL_EDGE)
-        _connect_item_to_node(dot, child, exit_id, color=_PARALLEL_EDGE)
+    # Parallel container: separate branches from standalone utility modules.
+    branches, standalone = _partition_children(
+        children, rendered_children, modules_by_path,
+    )
+
+    for _, ep in branches:
+        _connect_node_to_item(dot, entry_id, ep, color=_PARALLEL_EDGE)
+        _connect_item_to_node(dot, ep, exit_id, color=_PARALLEL_EDGE)
+
+    # Same-rank hint for parallel branch entries.
+    if len(branches) >= 2:
+        with dot.subgraph() as s:
+            s.attr(rank="same")
+            for _, ep in branches:
+                s.node(ep.entry_id)
+
+    # Standalone utility modules get dashed edges, no exit connection.
+    for _, ep in standalone:
+        dot.edge(
+            entry_id, ep.entry_id,
+            style="dashed", color=_DETACHED_EDGE, arrowsize="0.5",
+        )
 
 
 def _connect_items(
