@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 class IPCChannel:
-    """File-based IPC between the main process and the Streamlit subprocess."""
+    """File-based IPC between the main process and the Panel subprocess."""
 
     def __init__(self, directory: Path | str | None = None) -> None:
         if directory is None:
@@ -17,6 +17,7 @@ class IPCChannel:
         else:
             self._dir = Path(directory)
             self._owns_dir = False
+        self._jsonl_cache: dict[str, dict] = {}
 
     @property
     def directory(self) -> Path:
@@ -46,19 +47,66 @@ class IPCChannel:
         with open(target, "a") as f:
             for entry in entries:
                 f.write(json.dumps(entry) + "\n")
+        cache = self._jsonl_cache.get(filename)
+        if cache is not None:
+            cache["entries"].extend(entries)
+            cache["offset"] = target.stat().st_size
+            cache["buffer"] = ""
+            cache["inode"] = target.stat().st_ino
 
     def _read_jsonl(self, filename: str) -> list[dict]:
         target = self._dir / filename
         if not target.exists():
+            self._jsonl_cache.pop(filename, None)
             return []
-        entries: list[dict] = []
         try:
-            for line in target.read_text().splitlines():
-                if line.strip():
-                    entries.append(json.loads(line))
-        except (json.JSONDecodeError, OSError):
-            pass
-        return entries
+            stat = target.stat()
+        except OSError:
+            self._jsonl_cache.pop(filename, None)
+            return []
+
+        cache = self._jsonl_cache.get(filename)
+        if cache is None or stat.st_size < cache["offset"] or stat.st_ino != cache["inode"]:
+            cache = {
+                "entries": [],
+                "offset": 0,
+                "buffer": "",
+                "inode": stat.st_ino,
+            }
+            self._jsonl_cache[filename] = cache
+
+        if stat.st_size == cache["offset"]:
+            return cache["entries"]
+
+        try:
+            with open(target, "r") as f:
+                f.seek(cache["offset"])
+                chunk = f.read()
+        except OSError:
+            return cache["entries"]
+
+        text = cache["buffer"] + chunk
+        lines = text.splitlines(keepends=True)
+        remainder = ""
+        parsed: list[dict] = []
+
+        for line in lines:
+            if not line.endswith("\n"):
+                remainder = line
+                continue
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                parsed.append(json.loads(stripped))
+            except json.JSONDecodeError:
+                continue
+
+        cache["entries"].extend(parsed)
+        cache["offset"] = stat.st_size
+        cache["buffer"] = remainder
+        cache["inode"] = stat.st_ino
+        return cache["entries"]
 
     # ── Metadata ──────────────────────────────────────────────────────
 
@@ -155,6 +203,7 @@ class IPCChannel:
         target = self._dir / "_requests.jsonl"
         if target.exists():
             target.unlink()
+        self._jsonl_cache.pop("_requests.jsonl", None)
 
     def write_response(self, request_id: str, data: dict) -> None:
         """Write a computation response."""
@@ -183,5 +232,6 @@ class IPCChannel:
     # ── Cleanup ───────────────────────────────────────────────────────
 
     def cleanup(self) -> None:
+        self._jsonl_cache.clear()
         if self._owns_dir and self._dir.exists():
             shutil.rmtree(self._dir, ignore_errors=True)

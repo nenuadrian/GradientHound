@@ -311,6 +311,8 @@ class WatchState:
 
     def _compute_network_state(self, step: int, req_id: str, ipc: IPCChannel) -> None:
         """Dump all parameter values for models under 1M params."""
+        import numpy as np
+
         total_params = sum(p.numel() for p in self.model.parameters())
         if total_params > 1_000_000:
             ipc.write_response(req_id, {
@@ -322,17 +324,18 @@ class WatchState:
         for param_name, param in self.model.named_parameters():
             data = param.data.detach().float().cpu()
             shape = list(data.shape)
-            # For display: flatten >2D tensors to 2D
-            if data.ndim == 0:
-                values = [[round(data.item(), 6)]]
-            elif data.ndim == 1:
-                values = [[round(v, 6) for v in data.tolist()]]
-            elif data.ndim == 2:
-                values = [[round(v, 6) for v in row] for row in data.tolist()]
+            # Vectorised rounding -- avoids per-element Python round() calls
+            arr = np.around(data.numpy(), decimals=6)
+
+            if arr.ndim == 0:
+                values = [[float(arr)]]
+            elif arr.ndim == 1:
+                values = [arr.tolist()]
+            elif arr.ndim == 2:
+                values = arr.tolist()
             else:
                 # Reshape higher-dim to 2D: (product of leading dims, last dim)
-                flat2d = data.reshape(-1, data.shape[-1])
-                values = [[round(v, 6) for v in row] for row in flat2d.tolist()]
+                values = arr.reshape(-1, arr.shape[-1]).tolist()
 
             layers.append({
                 "name": param_name,

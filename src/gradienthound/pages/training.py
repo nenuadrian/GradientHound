@@ -1,160 +1,246 @@
-"""Training page -- predictions vs actual, attention, activations, CKA similarity."""
+"""Training page -- predictions, CKA similarity, attention patterns, activations."""
 from __future__ import annotations
 
-import streamlit as st
+import panel as pn
+from bokeh.models import ColumnDataSource, LinearColorMapper, ColorBar
 
-from gradienthound.pages._common import inject_css, get_ipc, short_layer_name
-
-inject_css()
-
-st.header("Training Dynamics")
-
-ipc = get_ipc()
-if ipc is None:
-    st.error("IPC channel not initialised.")
-    st.stop()
+from ._common import (
+    make_figure, make_hbar_figure, short_layer_name, BLUE, latest_entries,
+)
 
 
-@st.fragment(run_every=2)
-def _training_dynamics() -> None:
-    import pandas as pd
+def create(ipc):
+    """Build the training dynamics page.  Returns ``(layout, update_fn)``."""
 
-    # ── Predictions vs Actual (Value Calibration) ─────────────────────
-    predictions = ipc.read_predictions()
-    if predictions:
-        with st.expander("Predictions vs Actual (Value Calibration)", expanded=True):
+    info_pane = pn.pane.Alert(
+        "No training dynamics data yet.  Use `gh.watch(model, log_activations=True)`, "
+        "`gh.log_predictions()`, or `gh.log_attention()` to populate this page.",
+        alert_type="info",
+    )
+
+    # ── Predictions vs Actual ────────────────────────────────────────
+    pred_select = pn.widgets.Select(name="Source", options=[], width=300)
+    pred_src = ColumnDataSource(data={"actual": [], "predicted": []})
+    pred_fig = make_figure(title="Predictions vs Actual (Value Calibration)",
+                           x_label="Actual", y_label="Predicted", height=350)
+    pred_fig.scatter("actual", "predicted", source=pred_src, size=5,
+                     color=BLUE, alpha=0.6)
+    # diagonal reference line
+    pred_fig.line([0, 1], [0, 1], line_dash="dashed", line_color="#666",
+                  line_width=1)
+    pred_caption = pn.pane.Markdown("")
+
+    pred_card = pn.Card(
+        pred_select,
+        pn.pane.Bokeh(pred_fig, sizing_mode="stretch_width"),
+        pred_caption,
+        title="Predictions vs Actual", collapsed=True,
+        sizing_mode="stretch_width", visible=False,
+    )
+
+    # ── CKA (on-demand) ──────────────────────────────────────────────
+    cka_button = pn.widgets.Button(name="Compute CKA Matrix",
+                                    button_type="primary")
+    cka_pane = pn.pane.Bokeh(sizing_mode="stretch_width")
+    cka_caption = pn.pane.Markdown(
+        "*Click the button to compute CKA similarity between all 2D weight layers.*")
+    cka_summary = pn.Row(sizing_mode="stretch_width")
+
+    def _on_cka_click(event):
+        ipc.clear_response("cka")
+        ipc.write_request({"id": "cka", "type": "cka"})
+        cka_caption.object = "*Computing...*"
+
+    cka_button.on_click(_on_cka_click)
+
+    cka_card = pn.Card(
+        cka_button, cka_caption, cka_pane, cka_summary,
+        title="CKA Layer Similarity (on-demand)", collapsed=True,
+        sizing_mode="stretch_width",
+    )
+
+    # ── Attention Patterns ───────────────────────────────────────────
+    attn_caption = pn.pane.Markdown("")
+    attn_slider = pn.widgets.IntSlider(name="Head", start=0, end=0, value=0,
+                                        width=300)
+    attn_pane = pn.pane.Bokeh(sizing_mode="stretch_width")
+
+    attn_card = pn.Card(
+        attn_caption, attn_slider, attn_pane,
+        title="Attention Patterns", collapsed=True,
+        sizing_mode="stretch_width", visible=False,
+    )
+
+    # ── Activation Stats ─────────────────────────────────────────────
+    act_table = pn.pane.DataFrame(sizing_mode="stretch_width")
+    act_src = ColumnDataSource(data={"layer": [], "zero_frac": []})
+    act_fig = make_hbar_figure(title="Zero Fraction by Layer", y_range=[],
+                                height=300)
+    act_fig.hbar(y="layer", right="zero_frac", source=act_src, height=0.7,
+                 color="#ff7043")
+    act_button = pn.widgets.Button(name="Compute", button_type="primary")
+
+    def _on_act_click(event):
+        import pandas as pd
+        act_stats = ipc.read_activation_stats()
+        if not act_stats:
+            return
+        latest_act = latest_entries(act_stats)
+        act_table.object = pd.DataFrame([{
+            "Layer": short_layer_name(e["layer"]),
+            "Mean": round(e["mean"], 4),
+            "Std": round(e["std"], 4),
+            "Min": round(e["min"], 4),
+            "Max": round(e["max"], 4),
+            "Zero %": f"{e.get('zero_fraction', 0) * 100:.1f}%",
+        } for e in latest_act])
+        al = [short_layer_name(e["layer"]) for e in latest_act]
+        zf = [e.get("zero_fraction", 0) for e in latest_act]
+        act_src.data = {"layer": al, "zero_frac": zf}
+        act_fig.y_range.factors = list(reversed(al))
+
+    act_button.on_click(_on_act_click)
+
+    act_card = pn.Card(
+        act_button, act_table,
+        pn.pane.Bokeh(act_fig, sizing_mode="stretch_width"),
+        title="Activation Statistics", collapsed=True,
+        sizing_mode="stretch_width", visible=False,
+    )
+
+    # ── layout ───────────────────────────────────────────────────────
+    content = pn.Column(
+        pred_card, cka_card, attn_card, act_card,
+        sizing_mode="stretch_width",
+    )
+
+    layout = pn.Column(
+        pn.pane.Markdown("## Training Dynamics"),
+        info_pane, content, sizing_mode="stretch_width",
+    )
+
+    state: dict = {"last_attn": None}
+
+    # ── attention head selector ──────────────────────────────────────
+
+    def _render_attn_head(event):
+        attention = ipc.read_attention()
+        if not attention:
+            return
+        latest = attention[-1]
+        weights = latest["weights"]
+        head = event.new
+        if head >= len(weights):
+            return
+        import numpy as np
+        from bokeh.palettes import Viridis256
+        matrix = np.array(weights[head])
+        mapper = LinearColorMapper(palette=Viridis256, low=float(matrix.min()),
+                                    high=float(matrix.max()))
+        fig = make_figure(title=f"Head {head}", x_label="Key",
+                          y_label="Query", height=350)
+        fig.image(image=[matrix], x=0, y=0,
+                  dw=matrix.shape[1], dh=matrix.shape[0],
+                  color_mapper=mapper)
+        cb = ColorBar(color_mapper=mapper, location=(0, 0))
+        fig.add_layout(cb, "right")
+        attn_pane.object = fig
+
+    attn_slider.param.watch(_render_attn_head, "value")
+
+    # ── prediction source selector ───────────────────────────────────
+
+    def _render_predictions(event):
+        predictions = ipc.read_predictions()
+        entries = [e for e in predictions if e["name"] == event.new]
+        if not entries:
+            return
+        latest = entries[-1]
+        pred = latest["predicted"]
+        actual = latest["actual"]
+        n = min(len(pred), len(actual))
+        pred_src.data = {"actual": actual[:n], "predicted": pred[:n]}
+        # adjust diagonal
+        all_vals = actual[:n] + pred[:n]
+        if all_vals:
+            lo, hi = min(all_vals), max(all_vals)
+            pred_fig.renderers[-1].data_source.data = {
+                "x": [lo, hi], "y": [lo, hi],
+            }
+        pred_caption.object = (
+            f"Step {latest.get('step', '?')} | {n} points | "
+            "Points on diagonal = perfect calibration"
+        )
+
+    pred_select.param.watch(_render_predictions, "value")
+
+    # ── periodic update ──────────────────────────────────────────────
+
+    def update():
+        predictions = ipc.read_predictions()
+        attention = ipc.read_attention()
+        act_stats = ipc.read_activation_stats()
+
+        has_data = bool(predictions or attention or act_stats)
+        info_pane.visible = not has_data
+
+        # predictions - update selector options only (visual on demand via select)
+        if predictions:
+            pred_card.visible = True
             names = sorted({e["name"] for e in predictions})
-            selected_name = st.selectbox("Source", names, key="pred_name")
-            entries = [e for e in predictions if e["name"] == selected_name]
+            if pred_select.options != names:
+                pred_select.options = names
 
-            if entries:
-                latest = entries[-1]
-                pred = latest["predicted"]
-                actual = latest["actual"]
-                min_len = min(len(pred), len(actual))
-
-                df = pd.DataFrame({
-                    "Predicted": pred[:min_len],
-                    "Actual": actual[:min_len],
-                })
-                st.scatter_chart(df, x="Actual", y="Predicted", use_container_width=True)
-                st.caption(
-                    f"Step {latest.get('step', '?')} | "
-                    f"{min_len} points | "
-                    f"Points on diagonal = perfect calibration"
-                )
-
-    # ── CKA Similarity (on-demand) ────────────────────────────────────
-    with st.expander("CKA Layer Similarity (on-demand)", expanded=True):
-        if st.button("Compute CKA Matrix", key="cka_btn"):
-            ipc.clear_response("cka")
-            ipc.write_request({"id": "cka", "type": "cka"})
-
+        # CKA response check
         resp = ipc.read_response("cka")
         if resp and "error" not in resp:
             import numpy as np
+            from bokeh.palettes import Viridis256
             matrix = np.array(resp["matrix"])
             short_names = resp["short_names"]
+            mapper = LinearColorMapper(palette=Viridis256, low=0, high=1)
+            fig = make_figure(
+                title="Linear CKA Similarity", height=400,
+                x_range=short_names, y_range=list(reversed(short_names)),
+            )
+            fig.image(image=[np.flipud(matrix)], x=0, y=0,
+                      dw=len(short_names), dh=len(short_names),
+                      color_mapper=mapper)
+            cb = ColorBar(color_mapper=mapper, location=(0, 0))
+            fig.add_layout(cb, "right")
+            fig.xaxis.major_label_orientation = 0.8
+            cka_pane.object = fig
+            cka_caption.object = (
+                f"Step {resp.get('step', '?')} | {resp['n']} weight layers")
 
-            st.caption(f"Step {resp.get('step', '?')} | {resp['n']} weight layers")
-
-            try:
-                import matplotlib.pyplot as plt
-                fig, ax = plt.subplots(figsize=(8, 7))
-                im = ax.imshow(matrix, cmap="viridis", vmin=0, vmax=1, aspect="auto")
-                ax.set_xticks(range(len(short_names)))
-                ax.set_yticks(range(len(short_names)))
-                ax.set_xticklabels(short_names, rotation=45, ha="right", fontsize=7)
-                ax.set_yticklabels(short_names, fontsize=7)
-                ax.set_title("Linear CKA Similarity")
-                plt.colorbar(im, ax=ax)
-                fig.tight_layout()
-                st.pyplot(fig)
-                plt.close(fig)
-            except ImportError:
-                st.dataframe(
-                    pd.DataFrame(matrix, columns=short_names, index=short_names),
-                    use_container_width=True,
-                )
-
-            # Summary stats
             n = len(matrix)
-            upper_vals = [matrix[i][j] for i in range(n) for j in range(i + 1, n)]
-            if upper_vals:
-                c1, c2 = st.columns(2)
-                c1.metric("Mean CKA (off-diag)", f"{sum(upper_vals) / len(upper_vals):.3f}")
-                c2.metric("Max CKA (off-diag)", f"{max(upper_vals):.3f}")
+            upper = [matrix[i][j] for i in range(n) for j in range(i+1, n)]
+            if upper:
+                cka_summary.clear()
+                cka_summary.extend([
+                    pn.indicators.Number(name="Mean CKA (off-diag)",
+                                         value=round(sum(upper)/len(upper), 3),
+                                         font_size="16pt", title_size="9pt"),
+                    pn.indicators.Number(name="Max CKA (off-diag)",
+                                         value=round(max(upper), 3),
+                                         font_size="16pt", title_size="9pt"),
+                ])
         elif resp and "error" in resp:
-            st.warning(resp["error"])
-        else:
-            st.caption("Click the button to compute CKA similarity between all 2D weight layers.")
+            cka_caption.object = f"**Error:** {resp['error']}"
 
-    # ── Attention Patterns ────────────────────────────────────────────
-    attention = ipc.read_attention()
-    if attention:
-        with st.expander("Attention Patterns", expanded=True):
-            import numpy as np
+        # attention - update visibility and slider config only (visual on demand via slider)
+        if attention:
+            attn_card.visible = True
+            latest = attention[-1]
+            n_heads = len(latest["weights"])
+            attn_caption.object = (
+                f"Step {latest.get('step', '?')} | Layer: {latest['name']} | "
+                f"Shape: {latest.get('shape', '?')}")
+            if attn_slider.end != max(0, n_heads - 1):
+                attn_slider.end = max(0, n_heads - 1)
 
-            entries = sorted(attention, key=lambda e: e.get("step", 0))
-            latest = entries[-1]
+        # activations - toggle visibility only (visual on demand via button)
+        if act_stats:
+            act_card.visible = True
 
-            st.caption(f"Step {latest.get('step', '?')} | Layer: {latest['name']} | Shape: {latest.get('shape', '?')}")
-
-            weights = latest["weights"]
-            n_heads = len(weights)
-            selected_head = st.slider("Head", 0, max(0, n_heads - 1), 0, key="attn_head")
-
-            if selected_head < n_heads:
-                matrix = weights[selected_head]
-                arr = np.array(matrix)
-                try:
-                    import matplotlib.pyplot as plt
-                    fig, ax = plt.subplots(figsize=(6, 5))
-                    im = ax.imshow(arr, cmap="viridis", aspect="auto")
-                    ax.set_xlabel("Key")
-                    ax.set_ylabel("Query")
-                    ax.set_title(f"Head {selected_head}")
-                    plt.colorbar(im, ax=ax)
-                    st.pyplot(fig)
-                    plt.close(fig)
-                except ImportError:
-                    st.dataframe(pd.DataFrame(arr), use_container_width=True)
-
-    # ── Activation Stats ──────────────────────────────────────────────
-    act_stats = ipc.read_activation_stats()
-    if act_stats:
-        with st.expander("Activation Statistics", expanded=False):
-            latest_step = max(e["step"] for e in act_stats)
-            latest_act = [e for e in act_stats if e["step"] == latest_step]
-            st.caption(f"Latest step: {latest_step}")
-
-            act_df = pd.DataFrame([
-                {
-                    "Layer": short_layer_name(e["layer"]),
-                    "Mean": round(e["mean"], 4),
-                    "Std": round(e["std"], 4),
-                    "Min": round(e["min"], 4),
-                    "Max": round(e["max"], 4),
-                    "Zero %": f"{e.get('zero_fraction', 0) * 100:.1f}%",
-                }
-                for e in latest_act
-            ])
-            if not act_df.empty:
-                st.dataframe(act_df, use_container_width=True, hide_index=True)
-
-            zf_df = pd.DataFrame([
-                {"Layer": short_layer_name(e["layer"]), "Zero Fraction": e.get("zero_fraction", 0)}
-                for e in latest_act
-            ])
-            if not zf_df.empty:
-                st.bar_chart(zf_df.set_index("Layer"), horizontal=True)
-
-    # ── Empty state ───────────────────────────────────────────────────
-    if not predictions and not attention and not act_stats:
-        st.info(
-            "No training dynamics data yet. Use `gh.watch(model, log_activations=True)`, "
-            "`gh.log_predictions()`, or `gh.log_attention()` to populate this page."
-        )
-
-
-_training_dynamics()
+    return layout, update

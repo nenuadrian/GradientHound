@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import os
 import socket
 import subprocess
 import sys
@@ -43,6 +44,7 @@ class GradientHound:
         self._ui = ui
         self._wandb_original_log: Any = None
         self._step: int = 0
+        self._last_flushed_step: int | None = None
 
         self._ipc.write_metadata(self._metadata)
 
@@ -55,25 +57,29 @@ class GradientHound:
         if port is None:
             port = _find_free_port()
 
-        app_path = Path(__file__).parent / "_streamlit_app.py"
+        app_path = Path(__file__).parent / "_panel_app.py"
+
+        env = os.environ.copy()
+        env["GRADIENTHOUND_IPC_DIR"] = str(self._ipc.directory)
 
         self._process = subprocess.Popen(
             [
-                sys.executable, "-m", "streamlit", "run",
+                sys.executable, "-m", "panel", "serve",
                 str(app_path),
-                "--server.headless", "true",
-                "--server.port", str(port),
-                "--server.fileWatcherType", "none",
-                "--browser.gatherUsageStats", "false",
-                "--",
-                "--ipc-dir", str(self._ipc.directory),
+                "--port", str(port),
+                "--allow-websocket-origin", f"localhost:{port}",
+                "--allow-websocket-origin", f"127.0.0.1:{port}",
             ],
+            env=env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
         url = f"http://localhost:{port}"
         print(f"GradientHound UI: {url}")
+
+        # Give Panel a moment to start before opening the browser
+        time.sleep(1.5)
         webbrowser.open_new_tab(url)
 
     def register_model(self, name: str, model: nn.Module) -> None:
@@ -112,16 +118,83 @@ class GradientHound:
             weight_every=weight_every,
         )
 
-    def step(self) -> None:
-        """Called each training step.  Flushes buffered stats to IPC."""
-        self._step += 1
+    def _sync_step(self, step: int | None = None, *, advance: bool = False) -> int:
+        """Synchronize the internal step counter with an external training step."""
+        if step is None:
+            if advance:
+                self._step += 1
+            return self._step
+
+        try:
+            resolved = int(step)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid step value: {step!r}") from exc
+
+        if resolved < 0:
+            raise ValueError(f"Step must be non-negative, got {resolved}")
+
+        if resolved > self._step:
+            self._step = resolved
+        return self._step
+
+    def step(self, step: int | None = None) -> None:
+        """Flush buffered stats to IPC at the current or supplied training step."""
+        current_step = self._sync_step(step, advance=step is None)
+        has_pending_buffers = any(
+            ws._grad_buffer or ws._activation_buffer  # noqa: SLF001
+            for ws in self._watches.values()
+        )
+        should_emit_weights = self._last_flushed_step != current_step
+
+        if self._last_flushed_step == current_step and not has_pending_buffers:
+            self._process_requests()
+            return
+
         for ws in self._watches.values():
-            ws.flush_gradient_stats(self._step, self._ipc)
-            ws.flush_activation_stats(self._step, self._ipc)
-            if self._step % ws.weight_every == 0:
-                ws.compute_weight_stats(self._step, self._ipc)
+            ws.flush_gradient_stats(current_step, self._ipc)
+            ws.flush_activation_stats(current_step, self._ipc)
+            if should_emit_weights and current_step % ws.weight_every == 0:
+                ws.compute_weight_stats(current_step, self._ipc)
                 self._flush_optimizer_state()
-            ws.process_requests(self._step, self._ipc)
+        self._last_flushed_step = current_step
+        # Process on-demand requests once per step, routing each request
+        # to the correct WatchState by model name.
+        self._process_requests()
+
+    def _process_requests(self) -> None:
+        """Read pending on-demand requests and route each to the right WatchState.
+
+        Reads the request queue *once* per ``step()`` so that requests are
+        never silently dropped when multiple WatchStates exist.
+        """
+        requests = self._ipc.read_requests()
+        if not requests:
+            return
+        self._ipc.clear_requests()
+
+        for req in requests:
+            model_name = req.get("model")
+            req_type = req.get("type")
+            req_id = req.get("id", req_type)
+
+            # Route to the matching WatchState, or fall back to the first one
+            ws = self._watches.get(model_name) if model_name else None
+            if ws is None and self._watches:
+                ws = next(iter(self._watches.values()))
+            if ws is None:
+                self._ipc.write_response(
+                    req_id, {"error": "no watched model available"})
+                continue
+
+            try:
+                if req_type == "weight_heatmap":
+                    ws._compute_weight_heatmap(req, self._step, req_id, self._ipc)
+                elif req_type == "cka":
+                    ws._compute_cka(self._step, req_id, self._ipc)
+                elif req_type == "network_state":
+                    ws._compute_network_state(self._step, req_id, self._ipc)
+            except Exception:
+                self._ipc.write_response(req_id, {"error": "computation failed"})
 
     def _flush_optimizer_state(self) -> None:
         """Extract live optimizer state statistics and write to IPC."""
@@ -227,12 +300,19 @@ class GradientHound:
             # Forward to real wandb.log first
             result = original_log(data, *args, **kwargs)
 
+            logged_step = kwargs.get("step")
+            if logged_step is not None:
+                self.step(step=logged_step)
+                entry_step = self._step
+            else:
+                entry_step = self._step
+                self._step += 1
+
             # Extract scalar values for our dashboard
-            entry: dict[str, Any] = {"_step": self._step, "_timestamp": time.time()}
+            entry: dict[str, Any] = {"_step": entry_step, "_timestamp": time.time()}
             for k, v in data.items():
                 if isinstance(v, (int, float)):
                     entry[k] = v
-            self._step += 1
 
             if len(entry) > 2:  # has more than just _step and _timestamp
                 self._ipc.append_metrics(entry)
@@ -252,7 +332,7 @@ class GradientHound:
             self._wandb_original_log = None
 
     def shutdown(self) -> None:
-        """Stop the Streamlit subprocess and clean up."""
+        """Stop the Panel subprocess and clean up."""
         self._restore_wandb()
 
         for ws in self._watches.values():

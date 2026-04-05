@@ -20,9 +20,7 @@ __version__ = "0.1.0"
 _run: GradientHound | None = None
 
 
-def _require_run() -> GradientHound:
-    if _run is None:
-        raise RuntimeError("Call gradienthound.init() first")
+def _get_run() -> GradientHound | None:
     return _run
 
 
@@ -40,15 +38,24 @@ def init(
 
 
 def register_model(name: str, model: nn.Module) -> None:
-    _require_run().register_model(name, model)
+    run = _get_run()
+    if run is None:
+        return
+    run.register_model(name, model)
 
 
 def register_optimizer(name: str, optimizer: optim.Optimizer) -> None:
-    _require_run().register_optimizer(name, optimizer)
+    run = _get_run()
+    if run is None:
+        return
+    run.register_optimizer(name, optimizer)
 
 
 def capture_wandb() -> None:
-    _require_run().capture_wandb()
+    run = _get_run()
+    if run is None:
+        return
+    run.capture_wandb()
 
 
 def watch(
@@ -60,7 +67,10 @@ def watch(
     weight_every: int = 50,
 ) -> None:
     """Enable automatic gradient/activation capture via PyTorch hooks."""
-    _require_run().watch(
+    run = _get_run()
+    if run is None:
+        return
+    run.watch(
         model, name,
         log_gradients=log_gradients,
         log_activations=log_activations,
@@ -68,19 +78,28 @@ def watch(
     )
 
 
-def step() -> None:
-    """Called each training step -- flushes buffered stats to IPC."""
-    _require_run().step()
+def step(step: int | None = None) -> None:
+    """Flush buffered stats to IPC at the current or supplied training step."""
+    run = _get_run()
+    if run is None:
+        return
+    run.step(step=step)
 
 
 def log_weights(name: str | None = None) -> None:
     """Force an immediate weight snapshot."""
-    _require_run().log_weights(name)
+    run = _get_run()
+    if run is None:
+        return
+    run.log_weights(name)
 
 
 def log_attention(name: str, weights: torch.Tensor) -> None:
     """Log attention weight matrix for visualization."""
-    _require_run().log_attention(name, weights)
+    run = _get_run()
+    if run is None:
+        return
+    run.log_attention(name, weights)
 
 
 def log_predictions(
@@ -89,7 +108,10 @@ def log_predictions(
     name: str = "default",
 ) -> None:
     """Log prediction vs actual for calibration scatter plot."""
-    _require_run().log_predictions(predicted, actual, name)
+    run = _get_run()
+    if run is None:
+        return
+    run.log_predictions(predicted, actual, name)
 
 
 def shutdown() -> None:

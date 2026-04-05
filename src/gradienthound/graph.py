@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+from dataclasses import dataclass
+from html import escape
 from typing import Any
 
 import graphviz
@@ -26,6 +29,20 @@ _COLORS: dict[str, str] = {
     "embedding": "#D6EAF8",
     "default": "#FFFFFF",
 }
+
+_CONTAINER_BG = "#F8FAFC"
+_CONTAINER_BORDER = "#CCD6E0"
+_CONTAINER_LABEL = "#51606F"
+_CARD_BORDER = "#C7D0D9"
+_SEQUENTIAL_EDGE = "#4E79A7"
+_PARALLEL_EDGE = "#7A7A7A"
+
+
+@dataclass(frozen=True)
+class _RenderEndpoints:
+    entry_id: str
+    exit_id: str
+    cluster_id: str | None = None
 
 
 def _module_category(type_name: str) -> str:
@@ -112,25 +129,6 @@ def extract_model_graph(name: str, model: nn.Module) -> dict:
     }
 
 
-def _format_attrs(attrs: dict[str, Any]) -> str:
-    """Format attributes into a compact label string."""
-    parts = []
-    if "in_channels" in attrs and "out_channels" in attrs:
-        ks = attrs.get("kernel_size", "")
-        if isinstance(ks, (tuple, list)):
-            ks = "x".join(str(k) for k in ks)
-        parts.append(f"{attrs['in_channels']}->{attrs['out_channels']}, k={ks}")
-    elif "in_features" in attrs and "out_features" in attrs:
-        parts.append(f"{attrs['in_features']}->{attrs['out_features']}")
-    elif "num_features" in attrs:
-        parts.append(f"features={attrs['num_features']}")
-    if "p" in attrs:
-        parts.append(f"p={attrs['p']}")
-    if "output_size" in attrs:
-        parts.append(f"out={attrs['output_size']}")
-    return ", ".join(parts)
-
-
 def _format_params(n: int) -> str:
     if n >= 1_000_000:
         return f"{n / 1_000_000:.1f}M"
@@ -139,7 +137,10 @@ def _format_params(n: int) -> str:
     return str(n)
 
 
-def render_graphviz(graph_data: dict) -> graphviz.Digraph:
+def render_graphviz(
+    graph_data: dict,
+    overlays: dict[str, dict[str, Any]] | None = None,
+) -> graphviz.Digraph:
     """Build a Graphviz Digraph from the extracted model graph data."""
     dot = graphviz.Digraph(
         name=graph_data["name"],
@@ -147,18 +148,20 @@ def render_graphviz(graph_data: dict) -> graphviz.Digraph:
             "rankdir": "TB",
             "fontname": "Helvetica",
             "bgcolor": "transparent",
-            "pad": "0.5",
+            "pad": "0.35",
+            "compound": "true",
+            "nodesep": "0.35",
+            "ranksep": "0.65",
+            "splines": "spline",
         },
         node_attr={
             "fontname": "Helvetica",
-            "fontsize": "10",
-            "shape": "box",
-            "style": "filled,rounded",
-            "penwidth": "1.2",
+            "shape": "plain",
         },
         edge_attr={
             "arrowsize": "0.7",
-            "color": "#666666",
+            "color": _PARALLEL_EDGE,
+            "penwidth": "1.3",
         },
     )
 
@@ -166,6 +169,7 @@ def render_graphviz(graph_data: dict) -> graphviz.Digraph:
     modules_by_path = {m["path"]: m for m in modules}
     root_path = graph_data["name"]
     root = modules_by_path.get(root_path)
+    overlays = overlays or {}
 
     if root is None:
         dot.node(
@@ -178,16 +182,35 @@ def render_graphviz(graph_data: dict) -> graphviz.Digraph:
         return dot
 
     # Keep rendering robust for very large models by capping visible nodes.
-    visible_paths = _select_visible_paths(root_path, modules_by_path, max_nodes=400)
+    visible_paths = set(_select_visible_paths(root_path, modules_by_path, max_nodes=400))
     io_cache: dict[str, tuple[str | None, str | None]] = {}
+    subtree_cache: dict[str, int] = {}
 
-    for path in visible_paths:
-        mod = modules_by_path[path]
-        _add_module_node(dot, path, mod, root_path, modules_by_path, io_cache)
+    _add_root_node(
+        dot=dot,
+        graph_data=graph_data,
+        root_path=root_path,
+        root=root,
+        modules_by_path=modules_by_path,
+        io_cache=io_cache,
+        overlay=overlays.get(root_path),
+    )
 
-    # Connect edges with structural semantics:
-    # sequential containers are chained, parallel containers fan out.
-    _add_structure_edges(dot, visible_paths, modules_by_path)
+    root_children = [c for c in root.get("children", []) if c in visible_paths]
+    rendered_children = [
+        _render_module(
+            dot=dot,
+            parent=dot,
+            path=child,
+            modules_by_path=modules_by_path,
+            visible_paths=visible_paths,
+            io_cache=io_cache,
+            subtree_cache=subtree_cache,
+            overlays=overlays,
+        )
+        for child in root_children
+    ]
+    _connect_root_children(dot, root_path, root, root_children, rendered_children)
 
     return dot
 
@@ -220,49 +243,222 @@ def _select_visible_paths(
     return order
 
 
-def _add_module_node(
+def _render_module(
+    *,
     dot: graphviz.Digraph,
+    parent: graphviz.Digraph,
     path: str,
-    mod: dict,
+    modules_by_path: dict[str, dict],
+    visible_paths: set[str],
+    io_cache: dict[str, tuple[str | None, str | None]],
+    subtree_cache: dict[str, int],
+    overlays: dict[str, dict[str, Any]],
+) -> _RenderEndpoints:
+    """Render a module or container recursively and return its flow endpoints."""
+    mod = modules_by_path[path]
+    visible_children = [c for c in mod.get("children", []) if c in visible_paths]
+    overlay = overlays.get(path)
+
+    if not mod.get("is_container") or not visible_children:
+        _add_module_node(
+            parent=parent,
+            path=path,
+            mod=mod,
+            modules_by_path=modules_by_path,
+            io_cache=io_cache,
+            subtree_cache=subtree_cache,
+            overlay=overlay,
+        )
+        return _RenderEndpoints(entry_id=path, exit_id=path)
+
+    cluster_id = _cluster_id(path)
+    entry_id = _anchor_id(path, "in")
+    exit_id = _anchor_id(path, "out")
+
+    with parent.subgraph(name=cluster_id) as cluster:
+        _style_container_cluster(
+            cluster=cluster,
+            path=path,
+            mod=mod,
+            visible_children=visible_children,
+            modules_by_path=modules_by_path,
+            io_cache=io_cache,
+            subtree_cache=subtree_cache,
+            overlay=overlay,
+        )
+        _add_anchor_node(cluster, entry_id)
+        _add_anchor_node(cluster, exit_id)
+
+        rendered_children = [
+            _render_module(
+                dot=dot,
+                parent=cluster,
+                path=child,
+                modules_by_path=modules_by_path,
+                visible_paths=visible_paths,
+                io_cache=io_cache,
+                subtree_cache=subtree_cache,
+                overlays=overlays,
+            )
+            for child in visible_children
+        ]
+
+    _connect_container_children(dot, mod, visible_children, rendered_children, entry_id, exit_id)
+    return _RenderEndpoints(entry_id=entry_id, exit_id=exit_id, cluster_id=cluster_id)
+
+
+def _add_root_node(
+    *,
+    dot: graphviz.Digraph,
+    graph_data: dict,
     root_path: str,
+    root: dict,
     modules_by_path: dict[str, dict],
     io_cache: dict[str, tuple[str | None, str | None]],
+    overlay: dict[str, Any] | None,
 ) -> None:
-    """Add a styled node for a module path."""
-    short_name = path if path == root_path else path.split(".")[-1]
-    children = mod.get("children", [])
-    kind = _node_kind(mod, children)
+    """Render the root model node as a compact summary card."""
+    in_dim, out_dim = _infer_node_io(root_path, modules_by_path, io_cache)
+    title = graph_data.get("name", root_path)
+    subtitle = graph_data.get("class")
+    if subtitle == title:
+        subtitle = None
+
+    primary_parts = [
+        f"{len(root.get('children', []))} top-level blocks",
+        f"{_format_params(graph_data.get('total_params', 0))} params",
+    ]
+    flow = _io_summary(in_dim, out_dim)
+    if flow:
+        primary_parts.append(flow)
+
+    body_lines = [
+        " | ".join(primary_parts),
+        f"{max(len(graph_data.get('modules', [])) - 1, 0)} modules tracked",
+    ]
+    accent = "#D6EAF8"
+    border = _CARD_BORDER
+    border_width = "1"
+    tooltip = _tooltip_text(
+        [
+            title,
+            f"class={graph_data.get('class')}" if graph_data.get("class") else None,
+            f"total_params={graph_data.get('total_params', 0):,}",
+        ]
+    )
+
+    accent, border, tooltip, body_lines, border_width = _apply_overlay_style(
+        accent=accent,
+        border=border,
+        tooltip=tooltip,
+        body_lines=body_lines,
+        border_width=border_width,
+        overlay=overlay,
+    )
+
+    dot.node(
+        root_path,
+        label=_card_label(
+            title=title,
+            subtitle=subtitle,
+            body_lines=body_lines,
+            accent=accent,
+            border=border,
+            border_width=border_width,
+        ),
+        tooltip=tooltip,
+    )
+
+
+def _add_module_node(
+    *,
+    parent: graphviz.Digraph,
+    path: str,
+    mod: dict,
+    modules_by_path: dict[str, dict],
+    io_cache: dict[str, tuple[str | None, str | None]],
+    subtree_cache: dict[str, int],
+    overlay: dict[str, Any] | None,
+) -> None:
+    """Add a compact card for a module or collapsed container."""
+    title, subtitle = _node_heading(path, mod)
     in_dim, out_dim = _infer_node_io(path, modules_by_path, io_cache)
 
-    label_parts = [
-        f"In: {in_dim or '-'}",
-        f"{short_name} | {kind}",
-        f"Params: {mod['params']:,}",
-        f"Out: {out_dim or '-'}",
-    ]
-    label = "\\n".join(label_parts)
+    if mod.get("is_container"):
+        total_params = _count_subtree_params(path, modules_by_path, subtree_cache)
+        flow = _io_summary(in_dim, out_dim)
+        body_lines = [
+            f"{len(mod.get('children', []))} child modules",
+            f"{_format_params(total_params)} subtree params",
+        ]
+        if flow:
+            body_lines[-1] = f"{body_lines[-1]} | {flow}"
 
-    if path == root_path:
-        dot.node(path, label=label, fillcolor="#D6EAF8", shape="box", style="filled,rounded")
-        return
+        accent = _CONTAINER_BG
+        border = _CONTAINER_BORDER
+        border_width = "1"
+        tooltip = _module_tooltip(path, mod, in_dim, out_dim)
+        accent, border, tooltip, body_lines, border_width = _apply_overlay_style(
+            accent=accent,
+            border=border,
+            tooltip=tooltip,
+            body_lines=body_lines,
+            border_width=border_width,
+            overlay=overlay,
+        )
 
-    if mod["is_container"]:
-        dot.node(
+        parent.node(
             path,
-            label=label,
-            fillcolor="#F8F9FA",
-            color="#9AA0A6",
-            shape="box",
-            style="filled,rounded,dashed",
+            label=_card_label(
+                title=title,
+                subtitle=subtitle or "Container",
+                body_lines=body_lines,
+                accent=accent,
+                border=border,
+                border_width=border_width,
+            ),
+            tooltip=tooltip,
         )
         return
 
-    color = _COLORS.get(_module_category(mod["type"]), _COLORS["default"])
-    attr_str = _format_attrs(mod.get("attributes", {}))
-    final_label = label
-    if attr_str:
-        final_label = f"{label}\\n{attr_str}"
-    dot.node(path, label=final_label, fillcolor=color)
+    attr_summary = _attribute_summary(mod.get("attributes", {}))
+    flow = _io_summary(in_dim, out_dim)
+    params_text = f"{_format_params(mod['params'])} params"
+
+    if flow and attr_summary:
+        body_lines = [flow, f"{attr_summary} | {params_text}"]
+    elif flow:
+        body_lines = [flow, params_text]
+    elif attr_summary:
+        body_lines = [attr_summary, params_text]
+    else:
+        body_lines = [params_text]
+
+    accent = _COLORS.get(_module_category(mod["type"]), _COLORS["default"])
+    border = _CARD_BORDER
+    border_width = "1"
+    tooltip = _module_tooltip(path, mod, in_dim, out_dim)
+    accent, border, tooltip, body_lines, border_width = _apply_overlay_style(
+        accent=accent,
+        border=border,
+        tooltip=tooltip,
+        body_lines=body_lines,
+        border_width=border_width,
+        overlay=overlay,
+    )
+
+    parent.node(
+        path,
+        label=_card_label(
+            title=title,
+            subtitle=subtitle,
+            body_lines=body_lines,
+            accent=accent,
+            border=border,
+            border_width=border_width,
+        ),
+        tooltip=tooltip,
+    )
 
 
 def _node_kind(mod: dict, children: list[str]) -> str:
@@ -364,30 +560,162 @@ def _summarize_dims(values: list[str]) -> str | None:
     return "multi"
 
 
-def _add_structure_edges(
-    dot: graphviz.Digraph,
-    visible_paths: list[str],
+def _style_container_cluster(
+    *,
+    cluster: graphviz.Digraph,
+    path: str,
+    mod: dict,
+    visible_children: list[str],
     modules_by_path: dict[str, dict],
+    io_cache: dict[str, tuple[str | None, str | None]],
+    subtree_cache: dict[str, int],
+    overlay: dict[str, Any] | None,
 ) -> None:
-    """Connect children as sequential chains or parallel fan-outs."""
-    visible = set(visible_paths)
+    """Apply Graphviz cluster styling for container modules."""
+    short_name = path.split(".")[-1]
+    container_type = _node_kind(mod, visible_children).title()
+    total_params = _format_params(_count_subtree_params(path, modules_by_path, subtree_cache))
+    in_dim, out_dim = _infer_node_io(path, modules_by_path, io_cache)
+    flow = _io_summary(in_dim, out_dim)
 
-    for path in visible_paths:
-        mod = modules_by_path[path]
-        children = [c for c in mod.get("children", []) if c in visible]
-        if not children:
-            continue
+    label_parts = [
+        container_type,
+        f"{len(mod.get('children', []))} children",
+        f"{total_params} params",
+    ]
+    if flow:
+        label_parts.append(flow)
 
-        if _is_sequential_container(mod, children):
-            # Sequential: parent -> first child, then child_i -> child_{i+1}
-            dot.edge(path, children[0], color="#4E79A7")
-            for i in range(len(children) - 1):
-                dot.edge(children[i], children[i + 1], color="#4E79A7")
-            continue
+    color = _CONTAINER_BORDER
+    fillcolor = _CONTAINER_BG
+    fontcolor = _CONTAINER_LABEL
+    style = "rounded,filled"
+    penwidth = "1.2"
+    tooltip = _module_tooltip(path, mod, in_dim, out_dim)
+    if overlay:
+        color = overlay.get("color", color)
+        fillcolor = overlay.get("fillcolor", fillcolor)
+        fontcolor = overlay.get("fontcolor", fontcolor)
+        style = overlay.get("style", style)
+        tooltip = overlay.get("tooltip", tooltip)
+        if overlay.get("penwidth") is not None:
+            penwidth = str(overlay["penwidth"])
 
-        # Parallel: parent fans out to all direct children.
-        for child in children:
-            dot.edge(path, child, color="#7A7A7A")
+    cluster.attr(
+        label=f"{short_name} | {' | '.join(label_parts)}",
+        labelloc="t",
+        labeljust="l",
+        fontname="Helvetica",
+        fontsize="11",
+        fontcolor=fontcolor,
+        color=color,
+        fillcolor=fillcolor,
+        style=style,
+        penwidth=penwidth,
+        margin="18",
+        tooltip=tooltip,
+    )
+
+
+def _add_anchor_node(container: graphviz.Digraph, node_id: str) -> None:
+    """Create an invisible point used as a stable edge anchor inside a cluster."""
+    container.node(
+        node_id,
+        label="",
+        shape="point",
+        width="0.01",
+        height="0.01",
+        style="invis",
+    )
+
+
+def _connect_root_children(
+    dot: graphviz.Digraph,
+    root_path: str,
+    root: dict,
+    root_children: list[str],
+    rendered_children: list[_RenderEndpoints],
+) -> None:
+    """Connect the root summary card to its first-level modules."""
+    if not root_children or not rendered_children:
+        return
+
+    if _is_sequential_container(root, root_children):
+        _connect_node_to_item(dot, root_path, rendered_children[0], color=_SEQUENTIAL_EDGE)
+        for left, right in zip(rendered_children, rendered_children[1:]):
+            _connect_items(dot, left, right, color=_SEQUENTIAL_EDGE)
+        return
+
+    for child in rendered_children:
+        _connect_node_to_item(dot, root_path, child, color=_PARALLEL_EDGE)
+
+
+def _connect_container_children(
+    dot: graphviz.Digraph,
+    mod: dict,
+    children: list[str],
+    rendered_children: list[_RenderEndpoints],
+    entry_id: str,
+    exit_id: str,
+) -> None:
+    """Connect internal container flow using anchors and cluster-aware edges."""
+    if not rendered_children:
+        return
+
+    if _is_sequential_container(mod, children):
+        _connect_node_to_item(dot, entry_id, rendered_children[0], color=_SEQUENTIAL_EDGE)
+        for left, right in zip(rendered_children, rendered_children[1:]):
+            _connect_items(dot, left, right, color=_SEQUENTIAL_EDGE)
+        _connect_item_to_node(dot, rendered_children[-1], exit_id, color=_SEQUENTIAL_EDGE)
+        return
+
+    for child in rendered_children:
+        _connect_node_to_item(dot, entry_id, child, color=_PARALLEL_EDGE)
+        _connect_item_to_node(dot, child, exit_id, color=_PARALLEL_EDGE)
+
+
+def _connect_items(
+    dot: graphviz.Digraph,
+    left: _RenderEndpoints,
+    right: _RenderEndpoints,
+    *,
+    color: str,
+) -> None:
+    """Connect two rendered modules, respecting cluster boundaries."""
+    attrs = {"color": color}
+    if left.cluster_id:
+        attrs["ltail"] = left.cluster_id
+    if right.cluster_id:
+        attrs["lhead"] = right.cluster_id
+    dot.edge(left.exit_id, right.entry_id, **attrs)
+
+
+def _connect_node_to_item(
+    dot: graphviz.Digraph,
+    node_id: str,
+    item: _RenderEndpoints,
+    *,
+    color: str,
+) -> None:
+    """Connect a concrete node to a rendered item."""
+    attrs = {"color": color}
+    if item.cluster_id:
+        attrs["lhead"] = item.cluster_id
+    dot.edge(node_id, item.entry_id, **attrs)
+
+
+def _connect_item_to_node(
+    dot: graphviz.Digraph,
+    item: _RenderEndpoints,
+    node_id: str,
+    *,
+    color: str,
+) -> None:
+    """Connect a rendered item to a concrete node."""
+    attrs = {"color": color}
+    if item.cluster_id:
+        attrs["ltail"] = item.cluster_id
+    dot.edge(item.exit_id, node_id, **attrs)
 
 
 def _is_sequential_container(mod: dict, children: list[str]) -> bool:
@@ -414,3 +742,188 @@ def _children_look_indexed(children: list[str]) -> bool:
     return numeric >= max(2, len(names) // 2)
 
 
+def _count_subtree_params(
+    path: str,
+    modules_by_path: dict[str, dict],
+    cache: dict[str, int],
+) -> int:
+    """Return parameter count for a module including all descendants."""
+    if path in cache:
+        return cache[path]
+
+    mod = modules_by_path[path]
+    total = mod["params"]
+    for child in mod.get("children", []):
+        if child in modules_by_path:
+            total += _count_subtree_params(child, modules_by_path, cache)
+
+    cache[path] = total
+    return total
+
+
+def _node_heading(path: str, mod: dict) -> tuple[str, str | None]:
+    """Return the title/subtitle pair for a node card."""
+    short_name = path.split(".")[-1]
+    type_name = mod["type"]
+
+    if short_name.isdigit():
+        return type_name, f"Layer {short_name}"
+
+    if short_name == type_name:
+        return short_name, None
+
+    return short_name, type_name
+
+
+def _attribute_summary(attrs: dict[str, Any]) -> str | None:
+    """Return a short attribute summary suitable for a node body."""
+    parts: list[str] = []
+
+    if "kernel_size" in attrs:
+        parts.append(f"k {_format_dim(attrs['kernel_size'])}")
+    if "stride" in attrs and not _matches_any(attrs["stride"], 1, (1, 1)):
+        parts.append(f"s {_format_dim(attrs['stride'])}")
+    if "padding" in attrs and not _matches_any(attrs["padding"], 0, (0, 0)):
+        parts.append(f"p {_format_dim(attrs['padding'])}")
+    if "num_features" in attrs:
+        parts.append(f"{attrs['num_features']} features")
+    if "normalized_shape" in attrs:
+        parts.append(f"shape {_format_dim(attrs['normalized_shape'])}")
+    if "num_heads" in attrs:
+        parts.append(f"{attrs['num_heads']} heads")
+    if "output_size" in attrs:
+        parts.append(f"out {_format_dim(attrs['output_size'])}")
+    if "p" in attrs:
+        parts.append(f"drop {attrs['p']}")
+    if "inplace" in attrs and attrs["inplace"]:
+        parts.append("inplace")
+    if "num_embeddings" in attrs and "embedding_dim" in attrs:
+        parts.append(f"vocab {attrs['num_embeddings']}")
+        parts.append(f"dim {attrs['embedding_dim']}")
+
+    if not parts:
+        return None
+    return " | ".join(parts[:3])
+
+
+def _io_summary(in_dim: str | None, out_dim: str | None) -> str | None:
+    """Format an in/out summary, suppressing noisy heterogeneous values."""
+    if in_dim and out_dim and _is_clean_dim(in_dim) and _is_clean_dim(out_dim):
+        return f"{in_dim} -> {out_dim}"
+    if in_dim and _is_clean_dim(in_dim):
+        return f"in {in_dim}"
+    if out_dim and _is_clean_dim(out_dim):
+        return f"out {out_dim}"
+    return None
+
+
+def _is_clean_dim(value: str) -> bool:
+    """Return whether a dimension summary is concise enough to display inline."""
+    return value != "multi" and " | " not in value
+
+
+def _matches_any(value: Any, *candidates: Any) -> bool:
+    """Return whether a value equals any candidate without requiring hashing."""
+    return any(value == candidate for candidate in candidates)
+
+
+def _card_label(
+    *,
+    title: str,
+    subtitle: str | None,
+    body_lines: list[str],
+    accent: str,
+    border: str,
+    border_width: str,
+) -> str:
+    """Build an HTML-like Graphviz label for a compact module card."""
+    subtitle_html = ""
+    if subtitle:
+        subtitle_html = (
+            f'<BR/><FONT POINT-SIZE="9" COLOR="#52606D">{escape(subtitle)}</FONT>'
+        )
+
+    body_parts = []
+    for idx, line in enumerate(line for line in body_lines if line):
+        if idx == 0:
+            body_parts.append(f'<FONT POINT-SIZE="10">{escape(line)}</FONT>')
+        else:
+            body_parts.append(f'<FONT POINT-SIZE="9" COLOR="#5F6B7A">{escape(line)}</FONT>')
+
+    body_html = "<BR/>".join(body_parts)
+
+    return (
+        f"<<TABLE BORDER=\"{border_width}\" CELLBORDER=\"0\" CELLSPACING=\"0\" CELLPADDING=\"0\" "
+        f"COLOR=\"{border}\" BGCOLOR=\"#FFFFFF\">"
+        f"<TR><TD BGCOLOR=\"{accent}\" ALIGN=\"LEFT\" CELLPADDING=\"7\">"
+        f"<FONT POINT-SIZE=\"12\"><B>{escape(title)}</B></FONT>{subtitle_html}"
+        "</TD></TR>"
+        f"<TR><TD ALIGN=\"LEFT\" CELLPADDING=\"7\">{body_html}</TD></TR>"
+        "</TABLE>>"
+    )
+
+
+def _module_tooltip(
+    path: str,
+    mod: dict,
+    in_dim: str | None,
+    out_dim: str | None,
+) -> str:
+    """Return hover text with the full module context."""
+    parts = [
+        path,
+        mod.get("type_full") or mod["type"],
+        f"params={mod['params']:,}",
+    ]
+
+    flow = _io_summary(in_dim, out_dim)
+    if flow:
+        parts.append(flow)
+
+    attrs = mod.get("attributes", {})
+    if attrs:
+        parts.append(", ".join(f"{k}={_format_dim(v)}" for k, v in attrs.items()))
+
+    return _tooltip_text(parts)
+
+
+def _tooltip_text(parts: list[str | None]) -> str:
+    """Join tooltip parts while skipping empty values."""
+    return " | ".join(part for part in parts if part)
+
+
+def _apply_overlay_style(
+    *,
+    accent: str,
+    border: str,
+    tooltip: str,
+    body_lines: list[str],
+    border_width: str,
+    overlay: dict[str, Any] | None,
+) -> tuple[str, str, str, list[str], str]:
+    """Apply optional overlay styling and extra lines to a card."""
+    if not overlay:
+        return accent, border, tooltip, body_lines, border_width
+
+    accent = overlay.get("fillcolor", accent)
+    border = overlay.get("color", border)
+    tooltip = overlay.get("tooltip", tooltip)
+    if overlay.get("penwidth") is not None:
+        border_width = str(max(1, round(float(overlay["penwidth"]))))
+    extra_lines = [str(line) for line in overlay.get("extra_lines", []) if line]
+    return accent, border, tooltip, [*body_lines, *extra_lines], border_width
+
+
+def _cluster_id(path: str) -> str:
+    """Return a Graphviz-safe cluster identifier."""
+    return f"cluster_{_stable_token(path)}"
+
+
+def _anchor_id(path: str, kind: str) -> str:
+    """Return a stable synthetic node identifier."""
+    return f"__gh_{kind}_{_stable_token(path)}"
+
+
+def _stable_token(value: str) -> str:
+    """Return a short stable token for synthetic Graphviz ids."""
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
