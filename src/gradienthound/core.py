@@ -35,6 +35,7 @@ class GradientHound:
     ) -> None:
         self._models: dict[str, dict] = {}
         self._optimizers: dict[str, dict] = {}
+        self._optimizer_refs: dict[str, optim.Optimizer] = {}
         self._watches: dict[str, WatchState] = {}
         self._metadata: dict = metadata or {}
         self._ipc = IPCChannel()
@@ -85,6 +86,7 @@ class GradientHound:
         """Register an optimizer. The UI will display its configuration."""
         info = _extract_optimizer_info(optimizer)
         self._optimizers[name] = info
+        self._optimizer_refs[name] = optimizer
         self._ipc.write_optimizers(self._optimizers)
 
     # ── Hook-based capture ──────────────────────────────────────────
@@ -118,7 +120,18 @@ class GradientHound:
             ws.flush_activation_stats(self._step, self._ipc)
             if self._step % ws.weight_every == 0:
                 ws.compute_weight_stats(self._step, self._ipc)
+                self._flush_optimizer_state()
             ws.process_requests(self._step, self._ipc)
+
+    def _flush_optimizer_state(self) -> None:
+        """Extract live optimizer state statistics and write to IPC."""
+        entries = []
+        for name, optimizer in self._optimizer_refs.items():
+            entry = _extract_optimizer_state_stats(optimizer, self._step, name)
+            if entry:
+                entries.append(entry)
+        if entries:
+            self._ipc.append_optimizer_state(entries)
 
     def log_weights(self, name: str | None = None) -> None:
         """Force an immediate weight snapshot."""
@@ -270,20 +283,131 @@ def _extract_optimizer_info(optimizer: optim.Optimizer) -> dict:
         if isinstance(v, (int, float, bool, str)):
             defaults[k] = v
 
+    opt_type = type(optimizer).__name__
+    # Determine state buffer multiplier for memory estimation
+    adam_types = {"Adam", "AdamW", "NAdam", "RAdam", "Adagrad", "Adadelta"}
+    if opt_type in adam_types:
+        buffers_per_param = 2  # exp_avg + exp_avg_sq
+    elif opt_type in {"SGD", "ASGD"} and defaults.get("momentum", 0) > 0:
+        buffers_per_param = 1  # momentum_buffer
+    elif opt_type == "RMSprop":
+        buffers_per_param = 2 if defaults.get("momentum", 0) > 0 else 1
+    else:
+        buffers_per_param = 0
+
+    total_numel = 0
     param_groups = []
     for i, group in enumerate(optimizer.param_groups):
-        pg: dict = {"index": i, "num_params": len(group["params"])}
+        group_numel = sum(p.numel() for p in group["params"])
+        # Estimate bytes: param element size * numel * buffers
+        elem_size = 4  # default float32
+        if group["params"]:
+            elem_size = group["params"][0].element_size()
+        group_memory_bytes = group_numel * elem_size * buffers_per_param
+
+        pg: dict = {
+            "index": i,
+            "num_params": len(group["params"]),
+            "total_numel": group_numel,
+            "memory_bytes": group_memory_bytes,
+        }
         for k, v in group.items():
             if k == "params":
                 continue
             if isinstance(v, (int, float, bool, str)):
                 pg[k] = v
         param_groups.append(pg)
+        total_numel += group_numel
+
+    # Back-fill percentage of total
+    for pg in param_groups:
+        pg["pct_of_total"] = round(pg["total_numel"] / max(total_numel, 1) * 100, 1)
+
+    total_memory = sum(pg["memory_bytes"] for pg in param_groups)
 
     return {
-        "type": type(optimizer).__name__,
+        "type": opt_type,
         "defaults": defaults,
         "param_groups": param_groups,
+        "total_numel": total_numel,
+        "total_memory_bytes": total_memory,
+        "buffers_per_param": buffers_per_param,
+    }
+
+
+def _extract_optimizer_state_stats(
+    optimizer: optim.Optimizer, step: int, name: str,
+) -> dict | None:
+    """Extract per-group statistics from the live optimizer state buffers."""
+    import time as _time
+
+    state = optimizer.state
+    if not state:
+        return None
+
+    opt_type = type(optimizer).__name__
+    groups_stats = []
+
+    for i, group in enumerate(optimizer.param_groups):
+        exp_avg_norms: list[float] = []
+        exp_avg_sq_means: list[float] = []
+        momentum_norms: list[float] = []
+        adam_step: int = 0
+
+        for p in group["params"]:
+            if p not in state:
+                continue
+            s = state[p]
+
+            # Adam family
+            if "exp_avg" in s:
+                exp_avg_norms.append(s["exp_avg"].norm(2).item())
+            if "exp_avg_sq" in s:
+                exp_avg_sq_means.append(s["exp_avg_sq"].mean().item())
+            if "step" in s:
+                sv = s["step"]
+                adam_step = max(adam_step, int(sv.item()) if hasattr(sv, "item") else int(sv))
+
+            # SGD / RMSprop momentum
+            if "momentum_buffer" in s:
+                momentum_norms.append(s["momentum_buffer"].norm(2).item())
+
+        gs: dict = {"group_index": i, "lr": group.get("lr", 0)}
+
+        if exp_avg_norms:
+            gs["exp_avg_norm_mean"] = sum(exp_avg_norms) / len(exp_avg_norms)
+            gs["exp_avg_norm_max"] = max(exp_avg_norms)
+        if exp_avg_sq_means:
+            gs["exp_avg_sq_mean"] = sum(exp_avg_sq_means) / len(exp_avg_sq_means)
+            # Effective LR estimate: lr / (sqrt(avg second moment) + eps)
+            eps = group.get("eps", 1e-8)
+            avg_v = sum(exp_avg_sq_means) / len(exp_avg_sq_means)
+            gs["effective_lr"] = group.get("lr", 0) / (avg_v ** 0.5 + eps)
+        if momentum_norms:
+            gs["momentum_norm_mean"] = sum(momentum_norms) / len(momentum_norms)
+            gs["momentum_norm_max"] = max(momentum_norms)
+        if adam_step > 0:
+            gs["optimizer_step"] = adam_step
+            # Warmup progress: bias correction factor converges as step grows
+            betas = group.get("betas", (0.9, 0.999))
+            if isinstance(betas, (list, tuple)) and len(betas) == 2:
+                beta2 = betas[1]
+                # Bias correction factor for variance: 1 - beta2^step
+                bias_correction = 1 - beta2 ** adam_step
+                gs["bias_correction2"] = bias_correction
+                # ~99% corrected at step = log(0.01)/log(beta2)
+                import math
+                steps_to_converge = math.log(0.01) / math.log(beta2) if beta2 < 1 else 1000
+                gs["warmup_pct"] = min(100.0, round(adam_step / steps_to_converge * 100, 1))
+
+        groups_stats.append(gs)
+
+    return {
+        "step": step,
+        "optimizer": name,
+        "type": opt_type,
+        "groups": groups_stats,
+        "_timestamp": _time.time(),
     }
 
 

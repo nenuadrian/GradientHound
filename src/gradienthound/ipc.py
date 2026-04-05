@@ -132,6 +132,14 @@ class IPCChannel:
     def read_attention(self) -> list[dict]:
         return self._read_jsonl("attention.jsonl")
 
+    # ── Optimizer state stats ────────────────────────────────────────
+
+    def append_optimizer_state(self, entries: list[dict]) -> None:
+        self._append_jsonl("optimizer_state.jsonl", entries)
+
+    def read_optimizer_state(self) -> list[dict]:
+        return self._read_jsonl("optimizer_state.jsonl")
+
     # ── On-demand requests / responses ───────────────────────────────
 
     def write_request(self, request: dict) -> None:
