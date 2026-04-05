@@ -5,8 +5,8 @@ import panel as pn
 from bokeh.models import ColumnDataSource, HoverTool
 
 from ._common import (
-    make_figure, make_hbar_figure, short_layer_name, style_legend,
-    grad_health_color, GREEN, YELLOW, RED, BLUE, PALETTE,
+    make_figure, make_hbar_figure, short_layer_name, short_layer_names,
+    style_legend, grad_health_color, GREEN, YELLOW, RED, BLUE, PALETTE,
     latest_entries, latest_step,
 )
 
@@ -34,7 +34,7 @@ def create(ipc):
         if not stats:
             return
         latest = latest_entries(stats)
-        layers = [short_layer_name(e["layer"]) for e in latest]
+        layers = short_layer_names([e["layer"] for e in latest])
         norms = [e.get("grad_norm", 0) for e in latest]
         colors = [grad_health_color(n) for n in norms]
         flow_src.data = {"layer": layers, "norm": norms, "color": colors}
@@ -78,7 +78,7 @@ def create(ipc):
         cos_entries = [e for e in latest if "cosine_sim" in e]
         if not cos_entries:
             return
-        cl = [short_layer_name(e["layer"]) for e in cos_entries]
+        cl = short_layer_names([e["layer"] for e in cos_entries])
         cv = [e["cosine_sim"] for e in cos_entries]
         cc = []
         stable = noisy = osc = 0
@@ -116,7 +116,7 @@ def create(ipc):
     ratio_fig = make_hbar_figure(title="Update-to-Weight Ratio",
                                   y_range=[], height=300)
     ratio_fig.hbar(y="layer", right="ratio", source=ratio_src, height=0.7,
-                   color="#26c6da")
+                   color="#8bb8d4")
     ratio_caption = pn.pane.Markdown("")
     ratio_button = pn.widgets.Button(name="Compute", button_type="primary")
 
@@ -134,7 +134,7 @@ def create(ipc):
                     break
             if lr != 1e-3:
                 break
-        rl = [short_layer_name(e["layer"]) for e in latest]
+        rl = short_layer_names([e["layer"] for e in latest])
         rv = [(lr * e.get("grad_norm", 0)) / max(e.get("weight_norm", 1e-20), 1e-20)
               for e in latest]
         ratio_src.data = {"layer": rl, "ratio": rv}
@@ -157,10 +157,10 @@ def create(ipc):
     dead_fig = make_hbar_figure(title="Dead Neurons", y_range=[], height=300)
     dead_fig.hbar(y=dodge("layer", -0.15, range=dead_fig.y_range),
                   right="dead", source=dead_src, height=0.25,
-                  color="#ef5350", legend_label="Dead Grad %")
+                  color="#e85d6f", legend_label="Dead Grad %")
     dead_fig.hbar(y=dodge("layer", 0.15, range=dead_fig.y_range),
                   right="near_zero", source=dead_src, height=0.25,
-                  color="#ff7043", legend_label="Near-Zero Weight %")
+                  color="#e8a87c", legend_label="Near-Zero Weight %")
     style_legend(dead_fig)
     dead_button = pn.widgets.Button(name="Compute", button_type="primary")
 
@@ -169,7 +169,7 @@ def create(ipc):
         if not stats:
             return
         latest = latest_entries(stats)
-        dl = [short_layer_name(e["layer"]) for e in latest]
+        dl = short_layer_names([e["layer"] for e in latest])
         dead_src.data = {
             "layer": dl,
             "dead": [e.get("dead_grad_pct", 0) for e in latest],
@@ -190,7 +190,7 @@ def create(ipc):
     noise_fig = make_hbar_figure(title="Gradient Noise Scale", y_range=[],
                                   height=300)
     noise_fig.hbar(y="layer", right="noise", source=noise_src, height=0.7,
-                   color="#78909c")
+                   color="#b09a9e")
     noise_button = pn.widgets.Button(name="Compute", button_type="primary")
 
     def _on_noise_click(event):
@@ -198,7 +198,7 @@ def create(ipc):
         if not stats:
             return
         latest = latest_entries(stats)
-        nl = [short_layer_name(e["layer"]) for e in latest]
+        nl = short_layer_names([e["layer"] for e in latest])
         noise_src.data = {
             "layer": nl,
             "noise": [e.get("grad_noise_scale", 0) for e in latest],

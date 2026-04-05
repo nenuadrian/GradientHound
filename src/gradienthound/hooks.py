@@ -6,7 +6,6 @@ via ``GradientHound.step()``) to write buffered data to the IPC channel.
 """
 from __future__ import annotations
 
-import math
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -16,7 +15,6 @@ if TYPE_CHECKING:
 
     from .ipc import IPCChannel
 
-_HIST_BINS = 80
 _MAX_HEATMAP_DIM = 128
 
 
@@ -163,87 +161,15 @@ class WatchState:
 
     def compute_weight_stats(self, step: int, ipc: IPCChannel) -> None:
         """Compute per-layer weight statistics and write to IPC."""
-        import torch
+        from gradienthound.checkpoint import compute_tensor_stats
 
         ts = time.time()
-        entries: list[dict[str, Any]] = []
+        entries = compute_tensor_stats(self.model.named_parameters())
 
-        for param_name, param in self.model.named_parameters():
-            data = param.data
-            flat = data.flatten().float()
-
-            entry: dict[str, Any] = {
-                "step": step,
-                "model": self.name,
-                "layer": param_name,
-                "norm_l2": data.norm(2).item(),
-                "norm_frobenius": data.norm("fro").item() if data.ndim >= 2 else data.norm(2).item(),
-                "mean": flat.mean().item(),
-                "std": flat.std().item() if flat.numel() > 1 else 0.0,
-                "min": flat.min().item(),
-                "max": flat.max().item(),
-                "near_zero_pct": (flat.abs() < 1e-6).float().mean().item() * 100,
-                "numel": flat.numel(),
-                "shape": list(data.shape),
-                "_timestamp": ts,
-            }
-
-            # Kurtosis
-            if flat.numel() > 4:
-                mu = flat.mean()
-                sigma = flat.std()
-                if sigma > 1e-12:
-                    entry["kurtosis"] = ((flat - mu) / sigma).pow(4).mean().item() - 3.0
-                else:
-                    entry["kurtosis"] = 0.0
-            else:
-                entry["kurtosis"] = 0.0
-
-            # Histogram bins (80 bins, matching Minerva)
-            lo, hi = flat.min().item(), flat.max().item()
-            if hi - lo < 1e-12:
-                lo, hi = lo - 1.0, hi + 1.0
-            counts = torch.histc(flat, bins=_HIST_BINS, min=lo, max=hi)
-            bin_width = (hi - lo) / _HIST_BINS
-            bin_centers = [lo + (i + 0.5) * bin_width for i in range(_HIST_BINS)]
-            entry["hist_counts"] = counts.tolist()
-            entry["hist_centers"] = bin_centers
-
-            # SVD for 2D weight matrices
-            if data.ndim == 2 and "bias" not in param_name:
-                try:
-                    svs = torch.linalg.svdvals(data.float().detach())
-                    entry["singular_values"] = svs.tolist()
-
-                    # Cumulative energy
-                    sv_sq = svs.pow(2)
-                    total_energy = sv_sq.sum()
-                    if total_energy > 1e-12:
-                        cum_energy = sv_sq.cumsum(0) / total_energy
-                        entry["cumulative_energy"] = cum_energy.tolist()
-
-                    # Stable rank: ||W||_F^2 / sigma_max^2
-                    sigma_max_sq = svs[0].item() ** 2
-                    entry["stable_rank"] = total_energy.item() / max(sigma_max_sq, 1e-12)
-
-                    # Condition number
-                    entry["condition_number"] = svs[0].item() / max(svs[-1].item(), 1e-12)
-
-                    # Effective rank via entropy
-                    sv_sum = svs.sum()
-                    if sv_sum > 1e-12:
-                        p = svs / sv_sum
-                        p = p[p > 1e-12]
-                        entropy = -(p * p.log()).sum().item()
-                        entry["effective_rank"] = math.exp(entropy)
-                        entry["max_rank"] = min(data.shape[0], data.shape[1])
-                    else:
-                        entry["effective_rank"] = 0.0
-                        entry["max_rank"] = min(data.shape[0], data.shape[1])
-                except Exception:
-                    pass
-
-            entries.append(entry)
+        for entry in entries:
+            entry["step"] = step
+            entry["model"] = self.name
+            entry["_timestamp"] = ts
 
         if entries:
             ipc.append_weight_stats(entries)

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .checkpoint import compute_tensor_stats, process_checkpoints
 from .core import GradientHound
+from .export import export_model
 
 if TYPE_CHECKING:
     import torch
@@ -14,6 +16,8 @@ __all__ = [
     "init", "register_model", "register_optimizer",
     "capture_wandb", "shutdown",
     "watch", "step", "log_weights", "log_attention", "log_predictions",
+    "export_model",
+    "compute_tensor_stats", "process_checkpoints",
 ]
 __version__ = "0.1.0"
 

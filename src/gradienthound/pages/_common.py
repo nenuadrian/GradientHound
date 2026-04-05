@@ -6,18 +6,18 @@ from bokeh.models import HoverTool
 
 # ── Health colour palette ────────────────────────────────────────────
 
-GREEN = "#4caf50"
-YELLOW = "#ff9800"
-RED = "#f44336"
-BLUE = "#2196f3"
-GREY = "#9e9e9e"
+GREEN = "#6dbf8b"
+YELLOW = "#ffbf69"
+RED = "#e85d6f"
+BLUE = "#b08ddb"
+GREY = "#b09a9e"
 
-BRAND_RED = "#c62828"
+BRAND_RED = "#d4707a"
 
 # Chart line colours (10-colour cycle)
 PALETTE = [
-    "#42a5f5", "#66bb6a", "#ffa726", "#ef5350", "#ab47bc",
-    "#26c6da", "#ff7043", "#78909c", "#ec407a", "#9ccc65",
+    "#d4707a", "#b08ddb", "#e8a87c", "#6dbf8b", "#c2525e",
+    "#d4a76a", "#8bb8d4", "#b09a9e", "#e06070", "#9bc29b",
 ]
 
 
@@ -60,6 +60,32 @@ def short_layer_name(name: str) -> str:
     return ".".join(parts)
 
 
+def short_layer_names(names: list[str]) -> list[str]:
+    """Batch-shorten layer names, ensuring no duplicates for FactorRange."""
+    if not names:
+        return []
+    shorts = [short_layer_name(n) for n in names]
+    if len(set(shorts)) == len(shorts):
+        return shorts
+    max_depth = max(len(n.split(".")) for n in names)
+    for depth in range(4, max_depth + 1):
+        shorts = [
+            ".".join(parts[-depth:]) if len(parts := n.split(".")) > depth else n
+            for n in names
+        ]
+        if len(set(shorts)) == len(shorts):
+            return shorts
+    # True duplicates remain -- append a counter to disambiguate
+    shorts = list(names)
+    seen: dict[str, int] = {}
+    result: list[str] = []
+    for s in shorts:
+        count = seen.get(s, 0)
+        seen[s] = count + 1
+        result.append(s if count == 0 else f"{s} #{count + 1}")
+    return result
+
+
 def latest_step(entries: list[dict], key: str = "step") -> int:
     if not entries:
         return 0
@@ -97,23 +123,31 @@ def make_figure(title: str = "", x_label: str = "", y_label: str = "",
     defaults.update(kwargs)
     p = _bokeh_figure(title=title, x_axis_label=x_label,
                       y_axis_label=y_label, **defaults)
-    p.background_fill_color = "#1a1a2e"
-    p.border_fill_color = "#16213e"
-    p.outline_line_color = "#333"
-    p.grid.grid_line_color = "#2a2a4a"
-    p.grid.grid_line_alpha = 0.6
-    p.xaxis.axis_label_text_color = "#aaa"
-    p.yaxis.axis_label_text_color = "#aaa"
-    p.xaxis.major_label_text_color = "#888"
-    p.yaxis.major_label_text_color = "#888"
-    p.title.text_color = "#ddd"
-    p.title.text_font_size = "11pt"
-    p.xaxis.axis_line_color = "#444"
-    p.yaxis.axis_line_color = "#444"
-    p.xaxis.major_tick_line_color = "#444"
-    p.yaxis.major_tick_line_color = "#444"
+    p.background_fill_color = "#1a1012"
+    p.border_fill_color = "#0f0a0a"
+    p.outline_line_color = "#3a2028"
+    p.grid.grid_line_color = "#2e1a20"
+    p.grid.grid_line_alpha = 0.3
+    p.grid.grid_line_dash = [4, 4]
+    p.xaxis.axis_label_text_color = "#c4b0b4"
+    p.yaxis.axis_label_text_color = "#c4b0b4"
+    p.xaxis.major_label_text_color = "#b09a9e"
+    p.yaxis.major_label_text_color = "#b09a9e"
+    p.xaxis.major_label_text_font_size = "9pt"
+    p.yaxis.major_label_text_font_size = "9pt"
+    p.xaxis.axis_label_standoff = 12
+    p.yaxis.axis_label_standoff = 12
+    p.title.text_color = "#f0e6e8"
+    p.title.text_font_size = "13pt"
+    p.title.text_font_style = "normal"
+    p.xaxis.axis_line_color = "#3a2028"
+    p.yaxis.axis_line_color = "#3a2028"
+    p.xaxis.major_tick_line_color = "#3a2028"
+    p.yaxis.major_tick_line_color = "#3a2028"
     p.xaxis.minor_tick_line_color = None
     p.yaxis.minor_tick_line_color = None
+    p.toolbar.logo = None
+    p.toolbar.autohide = True
 
     # Wheel-zoom active by default so scroll immediately zooms the chart
     wzt = p.select_one(WheelZoomTool)
@@ -139,18 +173,20 @@ def make_hbar_figure(title: str = "", y_range: list[str] | None = None,
     """Horizontal bar figure with categorical y-axis."""
     from bokeh.models import FactorRange
     yr = FactorRange(*y_range) if y_range else FactorRange()
-    return make_figure(title=title, y_range=yr, **kwargs)
+    fig = make_figure(title=title, y_range=yr, **kwargs)
+    fig.xgrid.grid_line_color = None
+    return fig
 
 
 def style_legend(fig: _bokeh_figure) -> None:
     """Apply dark-theme styling to a figure's legend."""
     if fig.legend:
         fig.legend.click_policy = "hide"
-        fig.legend.label_text_color = "#ccc"
+        fig.legend.label_text_color = "#e0d4d6"
         fig.legend.label_text_font_size = "9pt"
-        fig.legend.background_fill_color = "#1a1a2e"
-        fig.legend.background_fill_alpha = 0.8
-        fig.legend.border_line_color = "#444"
+        fig.legend.background_fill_color = "#1a1012"
+        fig.legend.background_fill_alpha = 0.88
+        fig.legend.border_line_color = "#3a2028"
 
 
 def fmt_bytes(b: int | float) -> str:

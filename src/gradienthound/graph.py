@@ -20,22 +20,22 @@ _ATTR_KEYS = [
 
 # Color palette by module category
 _COLORS: dict[str, str] = {
-    "conv": "#D4E6F1",
-    "linear": "#D5F5E3",
-    "norm": "#FEF9E7",
-    "activation": "#FDEBD0",
-    "pool": "#E8DAEF",
-    "dropout": "#F2F3F4",
-    "embedding": "#D6EAF8",
-    "default": "#FFFFFF",
+    "conv": "#f0d4d8",
+    "linear": "#d8ecde",
+    "norm": "#faf0e0",
+    "activation": "#fae0d0",
+    "pool": "#e4d6ec",
+    "dropout": "#f0eaea",
+    "embedding": "#e0d4e8",
+    "default": "#faf6f6",
 }
 
-_CONTAINER_BG = "#F8FAFC"
-_CONTAINER_BORDER = "#CCD6E0"
-_CONTAINER_LABEL = "#51606F"
-_CARD_BORDER = "#C7D0D9"
-_SEQUENTIAL_EDGE = "#4E79A7"
-_PARALLEL_EDGE = "#7A7A7A"
+_CONTAINER_BG = "#faf6f6"
+_CONTAINER_BORDER = "#d4b8bc"
+_CONTAINER_LABEL = "#5e4a4e"
+_CARD_BORDER = "#d0b4b8"
+_SEQUENTIAL_EDGE = "#8b5c64"
+_PARALLEL_EDGE = "#8a7a7c"
 
 
 @dataclass(frozen=True)
@@ -336,7 +336,7 @@ def _add_root_node(
         " | ".join(primary_parts),
         f"{max(len(graph_data.get('modules', [])) - 1, 0)} modules tracked",
     ]
-    accent = "#D6EAF8"
+    accent = "#f0d4d8"
     border = _CARD_BORDER
     border_width = "1"
     tooltip = _tooltip_text(
@@ -840,7 +840,7 @@ def _card_label(
     subtitle_html = ""
     if subtitle:
         subtitle_html = (
-            f'<BR/><FONT POINT-SIZE="9" COLOR="#52606D">{escape(subtitle)}</FONT>'
+            f'<BR/><FONT POINT-SIZE="9" COLOR="#5e4a4e">{escape(subtitle)}</FONT>'
         )
 
     body_parts = []
@@ -848,13 +848,13 @@ def _card_label(
         if idx == 0:
             body_parts.append(f'<FONT POINT-SIZE="10">{escape(line)}</FONT>')
         else:
-            body_parts.append(f'<FONT POINT-SIZE="9" COLOR="#5F6B7A">{escape(line)}</FONT>')
+            body_parts.append(f'<FONT POINT-SIZE="9" COLOR="#6e5a5e">{escape(line)}</FONT>')
 
     body_html = "<BR/>".join(body_parts)
 
     return (
         f"<<TABLE BORDER=\"{border_width}\" CELLBORDER=\"0\" CELLSPACING=\"0\" CELLPADDING=\"0\" "
-        f"COLOR=\"{border}\" BGCOLOR=\"#FFFFFF\">"
+        f"COLOR=\"{border}\" BGCOLOR=\"#faf6f6\">"
         f"<TR><TD BGCOLOR=\"{accent}\" ALIGN=\"LEFT\" CELLPADDING=\"7\">"
         f"<FONT POINT-SIZE=\"12\"><B>{escape(title)}</B></FONT>{subtitle_html}"
         "</TD></TR>"

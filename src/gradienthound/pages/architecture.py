@@ -17,17 +17,17 @@ _OVERLAY_OPTIONS = [
 ]
 
 _STATE_FILL = {
-    "neutral": "#ECEFF1",
-    "healthy": "#D9F2E3",
-    "warning": "#FFF3CD",
-    "critical": "#F8D7DA",
+    "neutral": "#1e1416",
+    "healthy": "#1a2e22",
+    "warning": "#4b3720",
+    "critical": "#4a1820",
 }
 
 _BORDER_BY_SIGNAL = {
-    "neutral": "#90A4AE",
-    "gradient": "#42A5F5",
-    "activation": "#FF7043",
-    "weight": "#AB47BC",
+    "neutral": "#9c8088",
+    "gradient": "#8bb8d4",
+    "activation": "#e8a87c",
+    "weight": "#b08ddb",
 }
 
 _STATE_SCORES = {
@@ -767,23 +767,23 @@ def _legend_html(overlay_mode: str) -> str:
     return f"""
     <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:center;margin:4px 0 10px 0;">
       <span style="display:inline-flex;align-items:center;gap:8px;">
-        <span style="width:16px;height:16px;background:{_STATE_FILL['healthy']};border:2px solid #78909c;border-radius:4px;"></span>
+        <span style="width:16px;height:16px;background:{_STATE_FILL['healthy']};border:2px solid #9c8088;border-radius:4px;"></span>
         Healthy
       </span>
       <span style="display:inline-flex;align-items:center;gap:8px;">
-        <span style="width:16px;height:16px;background:{_STATE_FILL['warning']};border:2px solid #78909c;border-radius:4px;"></span>
+        <span style="width:16px;height:16px;background:{_STATE_FILL['warning']};border:2px solid #9c8088;border-radius:4px;"></span>
         Warning
       </span>
       <span style="display:inline-flex;align-items:center;gap:8px;">
-        <span style="width:16px;height:16px;background:{_STATE_FILL['critical']};border:2px solid #78909c;border-radius:4px;"></span>
+        <span style="width:16px;height:16px;background:{_STATE_FILL['critical']};border:2px solid #9c8088;border-radius:4px;"></span>
         Critical
       </span>
       <span style="display:inline-flex;align-items:center;gap:8px;">
-        <span style="width:16px;height:16px;background:{_STATE_FILL['neutral']};border:2px solid #78909c;border-radius:4px;"></span>
+        <span style="width:16px;height:16px;background:{_STATE_FILL['neutral']};border:2px solid #9c8088;border-radius:4px;"></span>
         No live data
       </span>
     </div>
-    <div style="color:#bbb;font-size:12px;">{border_text}</div>
+    <div style="color:#b09a9e;font-size:12px;">{border_text}</div>
     """
 
 
@@ -820,9 +820,10 @@ def _zoom_html(svg_str: str) -> str:
     )
 
     return f"""
-    <div style="width:100%;height:600px;border:1px solid #444;
-                border-radius:8px;overflow:hidden;position:relative;
-                background:#1e1e1e;cursor:grab;"
+    <div style="width:100%;height:600px;border:1px solid rgba(178,132,140,0.2);
+                border-radius:16px;overflow:hidden;position:relative;
+                background:radial-gradient(circle at top, rgba(180,60,70,0.06), transparent 30%), #0f0a0a;cursor:grab;
+                box-shadow:inset 0 1px 0 rgba(255,255,255,0.03);"
          data-s="1" data-px="0" data-py="0" data-drag="0"
          onwheel="event.preventDefault();
            var c=this,rect=c.getBoundingClientRect();
@@ -848,14 +849,18 @@ def _zoom_html(svg_str: str) -> str:
       {svg_str}
       <div style="position:absolute;bottom:8px;right:8px;display:flex;gap:4px;">
         <button onclick="{_btn_zoom(1.3)}" style="
-          width:32px;height:32px;border:none;border-radius:6px;
-          background:#333;color:#ccc;font-size:18px;cursor:pointer;">+</button>
+          width:32px;height:32px;border:none;border-radius:10px;
+          background:rgba(26,14,16,0.92);color:#f0e6e8;font-size:18px;cursor:pointer;
+          box-shadow:0 8px 20px rgba(0,0,0,0.22);">+</button>
         <button onclick="{_btn_zoom(1 / 1.3)}" style="
-          width:32px;height:32px;border:none;border-radius:6px;
-          background:#333;color:#ccc;font-size:18px;cursor:pointer;">&minus;</button>
+          width:32px;height:32px;border:none;border-radius:10px;
+          background:rgba(26,14,16,0.92);color:#f0e6e8;font-size:18px;cursor:pointer;
+          box-shadow:0 8px 20px rgba(0,0,0,0.22);">&minus;</button>
         <button onclick="{_reset}" style="
-          height:32px;border:none;border-radius:6px;padding:0 10px;
-          background:#333;color:#ccc;font-size:12px;cursor:pointer;">Reset</button>
+          height:32px;border:none;border-radius:10px;padding:0 10px;
+          background:linear-gradient(135deg, #d4707a 0%, #c2525e 100%);
+          color:#0f0a0a;font-size:12px;font-weight:700;cursor:pointer;
+          box-shadow:0 8px 20px rgba(194,82,94,0.18);">Reset</button>
       </div>
     </div>
     """

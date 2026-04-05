@@ -5,7 +5,8 @@ import panel as pn
 from bokeh.models import ColumnDataSource, LinearColorMapper, ColorBar
 
 from ._common import (
-    make_figure, make_hbar_figure, short_layer_name, BLUE, latest_entries,
+    make_figure, make_hbar_figure, short_layer_name, short_layer_names,
+    BLUE, latest_entries,
 )
 
 
@@ -26,7 +27,7 @@ def create(ipc):
     pred_fig.scatter("actual", "predicted", source=pred_src, size=5,
                      color=BLUE, alpha=0.6)
     # diagonal reference line
-    pred_fig.line([0, 1], [0, 1], line_dash="dashed", line_color="#666",
+    pred_fig.line([0, 1], [0, 1], line_dash="dashed", line_color="#5e4a4e",
                   line_width=1)
     pred_caption = pn.pane.Markdown("")
 
@@ -77,7 +78,7 @@ def create(ipc):
     act_fig = make_hbar_figure(title="Zero Fraction by Layer", y_range=[],
                                 height=300)
     act_fig.hbar(y="layer", right="zero_frac", source=act_src, height=0.7,
-                 color="#ff7043")
+                 color="#e8a87c")
     act_button = pn.widgets.Button(name="Compute", button_type="primary")
 
     def _on_act_click(event):
@@ -94,7 +95,7 @@ def create(ipc):
             "Max": round(e["max"], 4),
             "Zero %": f"{e.get('zero_fraction', 0) * 100:.1f}%",
         } for e in latest_act])
-        al = [short_layer_name(e["layer"]) for e in latest_act]
+        al = short_layer_names([e["layer"] for e in latest_act])
         zf = [e.get("zero_fraction", 0) for e in latest_act]
         act_src.data = {"layer": al, "zero_frac": zf}
         act_fig.y_range.factors = list(reversed(al))

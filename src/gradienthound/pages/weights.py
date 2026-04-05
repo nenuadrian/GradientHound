@@ -6,8 +6,8 @@ from bokeh.models import ColumnDataSource, LinearColorMapper, ColorBar, BasicTic
 from bokeh.palettes import RdBu11
 
 from ._common import (
-    make_figure, make_hbar_figure, short_layer_name, PALETTE, BLUE,
-    latest_entries, latest_step,
+    make_figure, make_hbar_figure, short_layer_name, short_layer_names,
+    PALETTE, BLUE, latest_entries, latest_step,
 )
 
 
@@ -44,12 +44,12 @@ def create(ipc):
     sv_src = ColumnDataSource(data={"index": [], "sv": []})
     sv_fig = make_figure(title="Singular Values", x_label="Index",
                          y_label="Value", height=260)
-    sv_fig.vbar(x="index", top="sv", width=0.7, source=sv_src, color="#ab47bc")
+    sv_fig.vbar(x="index", top="sv", width=0.7, source=sv_src, color="#b08ddb")
 
     ce_src = ColumnDataSource(data={"component": [], "energy": []})
     ce_fig = make_figure(title="Cumulative Energy", x_label="Component",
                          y_label="Energy", height=260)
-    ce_fig.line("component", "energy", source=ce_src, color="#26c6da",
+    ce_fig.line("component", "energy", source=ce_src, color="#8bb8d4",
                 line_width=2)
     ce_label = pn.pane.Markdown("")
     svd_metrics = pn.Row(sizing_mode="stretch_width")
@@ -75,7 +75,7 @@ def create(ipc):
     norm_button = pn.widgets.Button(name="Compute", button_type="primary")
 
     def _render_norms(latest: list[dict]) -> None:
-        layer_names = [short_layer_name(e["layer"]) for e in latest]
+        layer_names = short_layer_names([e["layer"] for e in latest])
         norms = [e["norm_l2"] for e in latest]
         norm_src.data = {"layer": layer_names, "norm": norms}
         norm_fig.y_range.factors = list(reversed(layer_names))
@@ -135,8 +135,8 @@ def create(ipc):
     time_fig = make_figure(title="Weight Stats Over Time", x_label="step",
                            height=280)
     for col, color, label in [
-        ("mean", "#42a5f5", "mean"), ("std", "#66bb6a", "std"),
-        ("min", "#ef5350", "min"), ("max", "#ffa726", "max"),
+        ("mean", "#8bb8d4", "mean"), ("std", "#6dbf8b", "std"),
+        ("min", "#e85d6f", "min"), ("max", "#e8a87c", "max"),
     ]:
         time_fig.line("step", col, source=time_src, color=color,
                       line_width=2, legend_label=label)
@@ -179,7 +179,7 @@ def create(ipc):
     sparsity_fig = make_hbar_figure(title="Near-Zero Weights (%)",
                                      y_range=[], height=300)
     sparsity_fig.hbar(y="layer", right="pct", source=sparsity_src,
-                      height=0.7, color="#ff7043")
+                      height=0.7, color="#e8a87c")
     sparsity_button = pn.widgets.Button(name="Compute", button_type="primary")
 
     def _on_sparsity_click(event):
@@ -187,7 +187,7 @@ def create(ipc):
         if not stats:
             return
         latest = latest_entries(stats)
-        sp_layers = [short_layer_name(e["layer"]) for e in latest]
+        sp_layers = short_layer_names([e["layer"] for e in latest])
         sp_pcts = [e.get("near_zero_pct", 0) for e in latest]
         sparsity_src.data = {"layer": sp_layers, "pct": sp_pcts}
         sparsity_fig.y_range.factors = list(reversed(sp_layers))
