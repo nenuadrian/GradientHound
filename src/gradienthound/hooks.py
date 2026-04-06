@@ -6,6 +6,7 @@ via ``GradientHound.step()``) to write buffered data to the IPC channel.
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -73,6 +74,9 @@ class WatchState:
         grad_mean = grad_flat.mean().item()
         grad_std = grad_flat.std().item() if grad_flat.numel() > 1 else 0.0
         grad_var = grad_flat.var().item() if grad_flat.numel() > 1 else 0.0
+        grad_abs = grad_flat.abs()
+        grad_abs_mean = grad_abs.mean().item()
+        grad_abs_max = grad_abs.max().item()
 
         dead_grad_pct = (grad_flat.abs() < 1e-7).float().mean().item() * 100
         near_zero_weight_pct = (weight_flat.abs() < 1e-6).float().mean().item() * 100
@@ -96,6 +100,8 @@ class WatchState:
             "grad_norm": grad_norm,
             "grad_mean": grad_mean,
             "grad_std": grad_std,
+            "grad_abs_mean": grad_abs_mean,
+            "grad_abs_max": grad_abs_max,
             "weight_norm": weight_norm,
             "dead_grad_pct": dead_grad_pct,
             "near_zero_weight_pct": near_zero_weight_pct,

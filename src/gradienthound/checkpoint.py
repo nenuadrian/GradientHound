@@ -329,6 +329,15 @@ def compute_tensor_stats(
                 else:
                     entry["effective_rank"] = 0.0
                     entry["max_rank"] = min(data.shape[0], data.shape[1])
+
+                # WeightWatcher-style spectral metrics
+                if "singular_values" in entry:
+                    from gradienthound.spectral import compute_spectral_metrics
+                    spectral = compute_spectral_metrics(
+                        entry["singular_values"],
+                        (data.shape[0], data.shape[1]),
+                    )
+                    entry.update(spectral)
             except Exception:
                 pass
 

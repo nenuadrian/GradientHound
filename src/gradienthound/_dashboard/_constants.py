@@ -23,9 +23,10 @@ SERIES_COLORS = [
 # ── Page definitions ───────────────────────────────────────────────────
 
 PAGES = {
-    "/":            ("Dashboard",   "Model overview, weights, gradients, and health"),
-    "/metrics":     ("Metrics",     "Run metrics from Weights & Biases"),
-    "/checkpoints": ("Checkpoints", "Compare model checkpoints"),
+    "/":               ("Dashboard",      "Model overview, weights, gradients, and health"),
+    "/gradient-flow":  ("Gradient Flow",  "Gradient magnitudes across layers"),
+    "/metrics":        ("Metrics",        "Run metrics from Weights & Biases"),
+    "/checkpoints":    ("Checkpoints",    "Compare model checkpoints"),
 }
 
 # ── Plotly light template ────────────────────────────────────────────

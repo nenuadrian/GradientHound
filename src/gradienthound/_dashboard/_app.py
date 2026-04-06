@@ -19,7 +19,7 @@ from ._helpers import (
 from ._health import weight_health
 from ._wandb import parse_wandb_project_run_id, fetch_wandb_run_metrics, metrics_page_wandb
 from ._pages import (
-    dashboard_page, landing_page_empty,
+    dashboard_page, gradient_flow_page, landing_page_empty,
     checkpoints_page, checkpoints_page_empty,
 )
 
@@ -102,6 +102,27 @@ def create_app(
         navbar,
         dbc.Container(html.Div(id="gh-content"), fluid=True, className="px-4"),
     ])
+
+    def _empty_gradflow_figure(message: str):
+        import plotly.graph_objects as go
+
+        fig = go.Figure()
+        fig.update_layout(
+            **plotly_layout(title="Gradient Flow"),
+            height=500,
+            xaxis={"visible": False},
+            yaxis={"visible": False},
+            annotations=[{
+                "text": message,
+                "xref": "paper",
+                "yref": "paper",
+                "x": 0.5,
+                "y": 0.5,
+                "showarrow": False,
+                "font": {"size": 14, "color": "#666"},
+            }],
+        )
+        return fig
 
     # ── Navbar toggle (mobile) ──────────────────────────────────────
 
@@ -217,6 +238,12 @@ def create_app(
                 default_project_run_id=wandb_state.get("project_run_id"),
             )
 
+        if pathname == "/gradient-flow":
+            model_names = []
+            if ipc is not None:
+                model_names = sorted(ipc.read_models().keys())
+            return gradient_flow_page(model_names=model_names)
+
         if pathname == "/checkpoints":
             if has_checkpoints:
                 return checkpoints_page(ckpt_state["paths"], snapshots)
@@ -227,6 +254,149 @@ def create_app(
             return placeholder_page(title, desc)
 
         return placeholder_page("Not Found", f"No page at {pathname}")
+
+    # ── Gradient flow page callbacks ───────────────────────────────
+
+    @callback(
+        Output("gradflow-chart", "figure"),
+        Output("gradflow-model-select", "options"),
+        Output("gradflow-model-select", "value"),
+        Output("gradflow-summary", "children"),
+        Input("gradflow-refresh", "n_intervals"),
+        Input("gradflow-model-select", "value"),
+        Input("gradflow-window", "value"),
+        Input("gradflow-hide-bias", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_gradient_flow(_n_intervals, selected_model, window_steps, hide_bias_opts):
+        import plotly.graph_objects as go
+
+        if ipc is None:
+            return (
+                _empty_gradflow_figure("No IPC data directory configured."),
+                [],
+                None,
+                "Pass --data-dir to load live gradient captures.",
+            )
+
+        entries = ipc.read_gradient_stats()
+        if not entries:
+            model_options = [
+                {"label": name, "value": name}
+                for name in sorted(ipc.read_models().keys())
+            ]
+            model_value = selected_model or (model_options[0]["value"] if model_options else None)
+            return (
+                _empty_gradflow_figure("Waiting for gradient stats... call gradienthound.step() during training."),
+                model_options,
+                model_value,
+                "No gradient records yet.",
+            )
+
+        model_names = sorted({e.get("model", "") for e in entries if e.get("model")})
+        if not model_names:
+            model_names = sorted(ipc.read_models().keys())
+        model_options = [{"label": name, "value": name} for name in model_names]
+
+        if selected_model not in model_names:
+            selected_model = model_names[0] if model_names else None
+
+        if selected_model:
+            model_entries = [e for e in entries if e.get("model") == selected_model]
+        else:
+            model_entries = entries
+
+        if not model_entries:
+            return (
+                _empty_gradflow_figure("No records for the selected model."),
+                model_options,
+                selected_model,
+                "No gradient records for this model.",
+            )
+
+        latest_step = max(int(e.get("step", 0)) for e in model_entries)
+        window_steps = int(window_steps or 10)
+        min_step = max(0, latest_step - window_steps + 1)
+        window_entries = [
+            e for e in model_entries
+            if min_step <= int(e.get("step", 0)) <= latest_step
+        ]
+
+        hide_bias = "hide_bias" in (hide_bias_opts or [])
+        layer_stats: dict[str, dict[str, float]] = {}
+        layer_order: list[str] = []
+
+        for rec in window_entries:
+            layer = str(rec.get("layer", ""))
+            if not layer:
+                continue
+            if hide_bias and layer.endswith(".bias"):
+                continue
+
+            avg_grad = rec.get("grad_abs_mean")
+            if avg_grad is None:
+                avg_grad = abs(float(rec.get("grad_mean", 0.0)))
+
+            max_grad = rec.get("grad_abs_max")
+            if max_grad is None:
+                max_grad = abs(float(rec.get("grad_mean", 0.0))) + float(rec.get("grad_std", 0.0))
+
+            if layer not in layer_stats:
+                layer_stats[layer] = {
+                    "avg_sum": 0.0,
+                    "avg_count": 0.0,
+                    "max_val": 0.0,
+                }
+                layer_order.append(layer)
+
+            layer_stats[layer]["avg_sum"] += float(avg_grad)
+            layer_stats[layer]["avg_count"] += 1.0
+            layer_stats[layer]["max_val"] = max(layer_stats[layer]["max_val"], float(max_grad))
+
+        if not layer_order:
+            return (
+                _empty_gradflow_figure("No layers remain after applying filters."),
+                model_options,
+                selected_model,
+                "No plottable layers after filters.",
+            )
+
+        x_layers = [short_layer(layer) for layer in layer_order]
+        avg_vals = [layer_stats[layer]["avg_sum"] / max(layer_stats[layer]["avg_count"], 1.0) for layer in layer_order]
+        max_vals = [layer_stats[layer]["max_val"] for layer in layer_order]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=x_layers,
+            y=max_vals,
+            name="max|grad|",
+            marker_color="#f39c12",
+            opacity=0.65,
+            hovertemplate="layer=%{x}<br>max|grad|=%{y:.6g}<extra></extra>",
+        ))
+        fig.add_trace(go.Bar(
+            x=x_layers,
+            y=avg_vals,
+            name="avg|grad|",
+            marker_color="#375a7f",
+            opacity=0.95,
+            hovertemplate="layer=%{x}<br>avg|grad|=%{y:.6g}<extra></extra>",
+        ))
+        fig.update_layout(
+            **plotly_layout(title="Gradient Flow Across Layers"),
+            barmode="overlay",
+            height=520,
+            xaxis_title="Layer",
+            yaxis_title="Gradient magnitude",
+            xaxis_tickangle=-45,
+            legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
+        )
+
+        summary = (
+            f"Model: {selected_model or 'all'} | Steps: {min_step}-{latest_step} | "
+            f"Layers: {len(layer_order)}"
+        )
+        return fig, model_options, selected_model, summary
 
     # ── Node click detail panels ─────────────────────────────────────
 
@@ -293,6 +463,58 @@ def create_app(
                 ))
         fig.update_layout(**plotly_layout(title=f"Singular Values \u2014 {short_layer(selected_layer)}"),
                           xaxis_title="Index", yaxis_title="Singular Value", yaxis_type="log", height=360)
+        return fig
+
+    # ── ESD (spectral analysis) callback ───────────────────────────────
+
+    @callback(
+        Output("esd-chart", "figure"),
+        Input("esd-layer-select", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_esd(selected_layer):
+        import plotly.graph_objects as go
+        snapshots = ckpt_state.get("snapshots", [])
+        fig = go.Figure()
+        for i, snap in enumerate(snapshots):
+            stat = next((s for s in snap["weight_stats"] if s["layer"] == selected_layer), None)
+            if stat and "esd" in stat:
+                evals = stat["esd"]
+                # Log-log histogram of eigenvalue density
+                pos_evals = sorted([e for e in evals if e > 0], reverse=True)
+                fig.add_trace(go.Scatter(
+                    x=list(range(1, len(pos_evals) + 1)),
+                    y=pos_evals,
+                    mode="lines",
+                    name=snap["name"],
+                    line={"color": SERIES_COLORS[i % len(SERIES_COLORS)]},
+                    hovertemplate="rank=%{x}<br>eigenvalue=%{y:.4g}<extra></extra>",
+                ))
+                # Mark MP edge if available
+                lambda_plus = stat.get("lambda_plus")
+                if lambda_plus is not None and i == len(snapshots) - 1:
+                    fig.add_hline(
+                        y=lambda_plus,
+                        line_dash="dash",
+                        line_color="#dc3545",
+                        annotation_text=f"MP edge ({lambda_plus:.3g})",
+                        annotation_position="top right",
+                    )
+        alpha_str = ""
+        if snapshots:
+            last_stat = next(
+                (s for s in snapshots[-1]["weight_stats"] if s["layer"] == selected_layer), None,
+            )
+            if last_stat and last_stat.get("alpha") is not None:
+                alpha_str = f"  |  alpha={last_stat['alpha']:.2f}"
+        fig.update_layout(
+            **plotly_layout(title=f"ESD \u2014 {short_layer(selected_layer)}{alpha_str}"),
+            xaxis_title="Rank",
+            yaxis_title="Eigenvalue",
+            xaxis_type="log",
+            yaxis_type="log",
+            height=380,
+        )
         return fig
 
     @callback(

@@ -39,6 +39,17 @@ def weight_health(stat: dict) -> tuple[str, str]:
     if cond is not None and cond > 1e4:
         return "warning", f"Poor conditioning ({cond:.1e})"
 
+    alpha = stat.get("alpha")
+    if alpha is not None:
+        if alpha > 8:
+            return "warning", f"Undertrained (alpha={alpha:.1f})"
+        if alpha < 1.5:
+            return "warning", f"Heavy-tailed ESD (alpha={alpha:.1f})"
+
+    mp_softrank = stat.get("mp_softrank")
+    if mp_softrank is not None and mp_softrank > 0.95:
+        return "warning", f"Near-random weights (MP softrank={mp_softrank:.2f})"
+
     if kurtosis is not None and abs(kurtosis) > 50:
         return "warning", f"Extreme kurtosis ({kurtosis:.1f})"
 
