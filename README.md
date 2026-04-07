@@ -4,7 +4,9 @@
     <img src="https://github.com/nenuadrian/GradientHound/blob/main/docs/assets/logo.png?raw=true" alt="logo" />
 </p>
 
-Hook into PyTorch training to capture and inspect model architectures, gradients, weights, and optimizer state.
+Mainly post-training tooling inspect model architectures, gradients, weights, and optimizer state. With hooks that can be added to existing training frameworks to capture model configurations. Expectations that regular checkpoints are created and are made available when running GH.
+
+This is mainly designed to work with my framework of training and my needs, and it is unlikely to work as is for anyone else in its current form, but it might be something useful to have around, bringing together multiple tools for network introspection, and hopefully develop over time a holistic analysis framework that can adapt to any model.
 
 ## Install
 
