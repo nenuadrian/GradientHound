@@ -701,6 +701,77 @@ def derive_checkpoint_name(path: str) -> str:
     return Path(path).stem
 
 
+# ── Checkpoint discovery ─────────────────────────────────────────────
+
+
+_CHECKPOINT_EXTENSIONS = {".pt", ".pth", ".ckpt"}
+
+
+def discover_checkpoints(locations: list[str]) -> list[str]:
+    """Discover checkpoint files from a mix of files and directories.
+
+    Recursively searches directories for files with checkpoint extensions
+    (``.pt``, ``.pth``, ``.ckpt``). Returns a sorted list of discovered paths.
+
+    Args:
+        locations: List of file paths or directory paths. Files are included
+            directly; directories are recursively searched for checkpoints.
+
+    Returns:
+        Sorted list of discovered checkpoint file paths (absolute or relative,
+        depending on input).
+    """
+    discovered: set[str] = set()
+
+    for location in locations:
+        p = Path(location)
+
+        if p.is_file():
+            # If it's a file, include it if it has a checkpoint extension
+            if p.suffix.lower() in _CHECKPOINT_EXTENSIONS:
+                discovered.add(str(p))
+        elif p.is_dir():
+            # Recursively search directory for checkpoint files
+            for ext in _CHECKPOINT_EXTENSIONS:
+                discovered.update(str(f) for f in p.glob(f"**/*{ext}"))
+        # else: path doesn't exist yet; silently skip
+
+    # Return sorted list for deterministic ordering
+    return sorted(discovered)
+
+
+def discover_model_exports(locations: list[str]) -> list[str]:
+    """Discover model export files from a mix of files and directories.
+
+    Recursively searches directories for files with ``.gh.json`` extension.
+    Returns a sorted list of discovered paths.
+
+    Args:
+        locations: List of file paths or directory paths. Files are included
+            directly; directories are recursively searched for model exports.
+
+    Returns:
+        Sorted list of discovered model export file paths (absolute or relative,
+        depending on input).
+    """
+    discovered: set[str] = set()
+
+    for location in locations:
+        p = Path(location)
+
+        if p.is_file():
+            # If it's a file, include it if it has a .gh.json extension
+            if p.suffix.lower() == ".json" and p.name.endswith(".gh.json"):
+                discovered.add(str(p))
+        elif p.is_dir():
+            # Recursively search directory for .gh.json files
+            discovered.update(str(f) for f in p.glob("**/*.gh.json"))
+        # else: path doesn't exist yet; silently skip
+
+    # Return sorted list for deterministic ordering
+    return sorted(discovered)
+
+
 # ── Orchestration ────────────────────────────────────────────────────
 
 

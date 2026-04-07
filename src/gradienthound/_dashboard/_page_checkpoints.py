@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import dash_bootstrap_components as dbc
-from dash import html
+from dash import html, dcc
 
 from ._helpers import (
     compute_optimizer_summary_table, compute_optimizer_evolution_table,
@@ -27,31 +27,56 @@ def checkpoints_page(ckpt_paths: list[str], snapshots: list[dict] | None):
         html.P(f"{len(ckpt_paths)} checkpoint files loaded", className="text-muted mb-4"),
     ]
 
-    file_rows = []
-    for i, path in enumerate(ckpt_paths):
-        p = Path(path)
-        size = ""
-        if p.exists():
-            size = _fmt_bytes(p.stat().st_size)
-        status = ""
-        if snapshots:
-            snap = next((s for s in snapshots if s["path"] == path), None)
-            if snap:
-                status = f"{len(snap['weight_stats'])} params"
-        file_rows.append(html.Tr([
-            html.Td(str(i + 1)),
-            html.Td(p.name),
-            html.Td(size),
-            html.Td(dbc.Badge(status, color="success") if status else "\u2014"),
-            html.Td(html.Code(str(path), style={"fontSize": "0.8em"})),
-        ]))
-
     children.append(dbc.Card(dbc.CardBody([
-        html.H5("Checkpoint Files", className="card-title"),
-        dbc.Table([
-            html.Thead(html.Tr([html.Th("#"), html.Th("File"), html.Th("Size"), html.Th("Status"), html.Th("Path")])),
-            html.Tbody(file_rows),
-        ], bordered=True, hover=True, responsive=True, size="sm"),
+        html.Div([
+            html.H5("Select Checkpoints to Process", className="card-title mb-3"),
+            
+            # Filter input and selection count on same row
+            dbc.Row([
+                dbc.Col([
+                    dbc.InputGroup([
+                        dbc.InputGroupText("Filter", style={"fontSize": "0.9em"}),
+                        dbc.Input(
+                            id="ckpt-filter-input",
+                            placeholder="e.g., ppo_step* or *step*",
+                            type="text",
+                        ),
+                    ]),
+                    html.Small("Use * for wildcards: ppo_step* matches names starting with 'ppo_step', *step* matches names containing 'step'",
+                              className="text-muted d-block mt-1"),
+                ], md=6),
+                dbc.Col([
+                    html.Div(
+                        id="ckpt-selection-count",
+                        className="text-end",
+                        style={"fontSize": "0.95em", "fontWeight": "500", "paddingTop": "0.375rem"}
+                    ),
+                ], md=6),
+            ], className="mb-3"),
+        ]),
+        
+        # File table with checkboxes
+        html.Div([
+            dbc.Table([
+                html.Thead(html.Tr([
+                    html.Th("", style={"width": "40px"}),  # Checkbox column
+                    html.Th("File"),
+                    html.Th("Size", style={"width": "80px"}),
+                    html.Th("Status", style={"width": "100px"}),
+                    html.Th("Path"),
+                ])),
+                html.Tbody(id="ckpt-table-body"),
+            ], bordered=True, hover=True, responsive=True, size="sm", className="mb-3"),
+        ]),
+        
+        # Select All / Clear buttons
+        dbc.ButtonGroup([
+            dbc.Button("Select All", id="ckpt-select-all-btn", color="secondary", size="sm"),
+            dbc.Button("Clear", id="ckpt-clear-btn", color="secondary", size="sm"),
+        ], className="mb-3"),
+        
+        # Store for hidden ckpt-selector (needed for callbacks)
+        dcc.Store(id="ckpt-selector", data=[str(i) for i in range(len(ckpt_paths))]),
     ]), className="mb-3"))
 
     if snapshots:
@@ -99,14 +124,14 @@ def checkpoints_page(ckpt_paths: list[str], snapshots: list[dict] | None):
             ]), className="mb-3"))
     else:
         children.append(dbc.Card(dbc.CardBody([
-            html.H5("Process", className="card-title"),
+            html.H5("Process Selected Checkpoints", className="card-title"),
             html.P(
-                "Load all checkpoints and compute per-parameter weight statistics "
+                "Load selected checkpoints and compute per-parameter weight statistics "
                 "(norms, distributions, SVD, kurtosis). This runs in the background "
                 "\u2014 you can navigate to other pages while it processes.",
                 className="text-muted",
             ),
-            dbc.Button("Process Checkpoints", id="ckpt-process-btn", color="primary", n_clicks=0),
+            dbc.Button("Process Selected Checkpoints", id="ckpt-process-btn", color="primary", n_clicks=0),
             html.Div(id="ckpt-status", className="mt-2 text-muted"),
         ]), className="mb-3"))
 

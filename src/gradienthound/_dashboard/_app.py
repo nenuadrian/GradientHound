@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import json
 import threading
+from fnmatch import fnmatch
 from pathlib import Path
 
 import dash_bootstrap_components as dbc
-from dash import Dash, html, dcc, callback, Output, Input, State, no_update
+from dash import Dash, html, dcc, callback, Output, Input, State, no_update, ctx, ALL
 import dash_cytoscape as cyto
 
 cyto.load_extra_layouts()
@@ -23,7 +24,7 @@ from ._wandb import parse_wandb_project_run_id, fetch_wandb_run_metrics, metrics
 from ._pages import (
     dashboard_page, gradient_flow_page, landing_page_empty,
     checkpoints_page, checkpoints_page_empty, weightwatcher_page,
-    live_page, on_demand_page, raw_data_page,
+    on_demand_page, raw_data_page,
 )
 
 
@@ -47,6 +48,7 @@ def _merge_model_exports(gh_files: list[Path]) -> dict:
     }
 
     names: list[str] = []
+    sub_root_paths: list[str] = []
     for gh_file in gh_files:
         with open(gh_file) as f:
             data = json.load(f)
@@ -81,14 +83,18 @@ def _merge_model_exports(gh_files: list[Path]) -> dict:
                 mod_copy["children"] = [f"{prefix}.{c}" for c in mod_copy["children"]]
             merged["module_tree"]["modules"].append(mod_copy)
 
-        # Add a synthetic parent node for this sub-model
-        top_children = [
-            f"{prefix}.{m['path']}" for m in mt.get("modules", [])
-            if m.get("path") and "." not in m["path"]
-        ]
-        # If the module tree has a root, just prefix it; otherwise create one
-        root_modules = [m for m in mt.get("modules", []) if m.get("path") == mt.get("name", "")]
-        if not root_modules:
+        # Determine the prefixed root path for this sub-model's tree.
+        mt_root_name = mt.get("name", "")
+        root_modules = [m for m in mt.get("modules", []) if m.get("path") == mt_root_name]
+        if root_modules:
+            # Root module was prefixed to "{prefix}.{mt_root_name}"
+            sub_root_paths.append(f"{prefix}.{mt_root_name}" if mt_root_name else prefix)
+        else:
+            # No root in the tree — create a synthetic parent
+            top_children = [
+                f"{prefix}.{m['path']}" for m in mt.get("modules", [])
+                if m.get("path") and "." not in m["path"]
+            ]
             merged["module_tree"]["modules"].append({
                 "path": prefix,
                 "type": data.get("model_name", name),
@@ -97,6 +103,7 @@ def _merge_model_exports(gh_files: list[Path]) -> dict:
                 "children": top_children,
                 "params": data.get("total_params", 0),
             })
+            sub_root_paths.append(prefix)
 
         # Merge FX graph with prefixed node names
         fx = data.get("fx_graph")
@@ -170,13 +177,13 @@ def _merge_model_exports(gh_files: list[Path]) -> dict:
     merged["model_class"] = ", ".join(names)
     merged["sub_models"] = names
 
-    # Add root node with children pointing to each sub-model
+    # Add root node with children pointing to each sub-model's root
     merged["module_tree"]["modules"].insert(0, {
         "path": "root",
         "type": merged["model_name"],
         "type_full": "",
         "is_leaf": False,
-        "children": names,
+        "children": sub_root_paths,
         "params": merged["total_params"],
     })
 
@@ -185,11 +192,12 @@ def _merge_model_exports(gh_files: list[Path]) -> dict:
 
 def create_app(
     data_dir: str | None = None,
-    model_path: str | None = None,
+    model_paths: list[str] | None = None,
     checkpoint_paths: list[str] | None = None,
     loader_path: str | None = None,
     wandb_entity: str | None = None,
     wandb_project_run_id: str | None = None,
+    model_path: str | None = None,  # Deprecated, for backward compatibility
 ) -> Dash:
     app = Dash(
         __name__,
@@ -198,21 +206,30 @@ def create_app(
         external_stylesheets=[dbc.themes.FLATLY],
     )
 
+    # Backward compatibility: if model_path is provided (old parameter), convert to model_paths
+    if model_path is not None and model_paths is None:
+        model_paths = [model_path]
+
     # Load model export(s)
     model_data: dict | None = None
-    if model_path:
-        p = Path(model_path)
-        gh_files: list[Path] = []
-        if p.is_dir():
-            gh_files = sorted(p.glob("*.gh.json"))
-        elif p.exists():
-            gh_files = [p]
-
-        if len(gh_files) == 1:
-            with open(gh_files[0]) as f:
+    available_models: dict[str, str] = {}  # {name: path} mapping
+    selected_model: str | None = None
+    
+    if model_paths:
+        # Build a mapping of model names (from filenames) to paths
+        for model_path in model_paths:
+            p = Path(model_path)
+            name = p.stem.replace(".gh", "")  # Remove .gh.json extension
+            if not name:
+                name = p.name
+            available_models[name] = model_path
+        
+        # Load the first model by default
+        if available_models:
+            selected_model = next(iter(available_models))
+            model_path = available_models[selected_model]
+            with open(model_path) as f:
                 model_data = json.load(f)
-        elif len(gh_files) > 1:
-            model_data = _merge_model_exports(gh_files)
 
     # IPC channel
     ipc = None
@@ -226,6 +243,7 @@ def create_app(
         "loader_path": loader_path,
         "processed": False,
         "snapshots": [],
+        "selected_indices": None,  # Track which checkpoints are selected for processing
     }
     has_checkpoints = bool(ckpt_state["paths"])
 
@@ -235,22 +253,55 @@ def create_app(
         "data": None,
     }
 
-    # Navbar
+    # Model state
+    model_state: dict = {
+        "available": available_models,
+        "selected": selected_model,
+        "current_data": model_data,
+    }
+
+    # Navbar with optional model selector
     nav_links = [
         dbc.NavLink(title, href=path, id=f"nav-{path}", active="exact")
         for path, (title, _) in PAGES.items()
     ]
+    
+    # Build navbar items
+    navbar_items = [
+        dbc.NavbarBrand("GradientHound", href="/", className="fw-bold"),
+        dbc.NavbarToggler(id="navbar-toggler", n_clicks=0),
+    ]
+    
+    # Add model selector if multiple models are available (before the collapse menu)
+    if len(available_models) > 1:
+        navbar_items.append(
+            dbc.Nav([
+                html.Span([
+                    "Model: ",
+                    dcc.Dropdown(
+                        id="model-selector",
+                        options=[{"label": name, "value": name} for name in sorted(available_models.keys())],
+                        value=selected_model,
+                        clearable=False,
+                        style={"minWidth": "150px"},
+                        className="d-inline-block",
+                    ),
+                ], className="me-3 d-flex align-items-center gap-2"),
+            ], className="align-items-center")
+        )
+    
+    # Add navigation links in a collapsible section
+    navbar_items.append(
+        dbc.Collapse(
+            dbc.Nav(nav_links, className="ms-auto", navbar=True),
+            id="navbar-collapse",
+            is_open=False,
+            navbar=True,
+        )
+    )
+    
     navbar = dbc.Navbar(
-        dbc.Container([
-            dbc.NavbarBrand("GradientHound", href="/", className="fw-bold"),
-            dbc.NavbarToggler(id="navbar-toggler", n_clicks=0),
-            dbc.Collapse(
-                dbc.Nav(nav_links, className="ms-auto", navbar=True),
-                id="navbar-collapse",
-                is_open=False,
-                navbar=True,
-            ),
-        ], fluid=True),
+        dbc.Container(navbar_items, fluid=True),
         color="light",
         dark=False,
         sticky="top",
@@ -274,6 +325,7 @@ def create_app(
         dcc.Location(id="url", refresh=False),
         dcc.Store(id="ckpt-store", data=None),
         dcc.Store(id="wandb-store", data=None),
+        dcc.Store(id="model-store", data={"selected": selected_model}),
         # Polling intervals for background tasks (disabled until a task starts)
         dcc.Interval(id="ckpt-poll", interval=1000, n_intervals=0, disabled=True),
         dcc.Interval(id="wandb-poll", interval=1000, n_intervals=0, disabled=True),
@@ -316,6 +368,24 @@ def create_app(
             return not is_open
         return is_open
 
+    # ── Model selector ───────────────────────────────────────────────
+
+    if len(available_models) > 1:
+        @callback(
+            Output("model-store", "data"),
+            Input("model-selector", "value"),
+            prevent_initial_call=True,
+        )
+        def _update_model_selection(selected_model_name):
+            if selected_model_name and selected_model_name in model_state["available"]:
+                model_path = model_state["available"][selected_model_name]
+                with open(model_path) as f:
+                    model_data_new = json.load(f)
+                model_state["selected"] = selected_model_name
+                model_state["current_data"] = model_data_new
+                return {"selected": selected_model_name, "data": model_data_new}
+            return {"selected": selected_model_name}
+
     # ── Global background-task status bar ─────────────────────────
 
     @callback(
@@ -340,11 +410,28 @@ def create_app(
     # ── Process checkpoints (background) ───────────────────────────
 
     if has_checkpoints:
+        # Store for tracking which checkpoint indices are currently visible in the table
+        ckpt_state["visible_indices"] = []
+        
         def _ckpt_worker():
             from gradienthound.checkpoint import process_checkpoints
             try:
+                # Get selected checkpoint paths
+                selected_paths = ckpt_state["paths"]  # Default to all
+                if ckpt_state["selected_indices"]:
+                    selected_indices_set = set(ckpt_state["selected_indices"])
+                    selected_paths = [
+                        path for i, path in enumerate(ckpt_state["paths"])
+                        if i in selected_indices_set
+                    ]
+                
+                if not selected_paths:
+                    bg_tasks["ckpt_error"] = "No checkpoints selected."
+                    bg_tasks["ckpt_done"] = True
+                    return
+                
                 snapshots = process_checkpoints(
-                    ckpt_state["paths"], loader_path=ckpt_state["loader_path"],
+                    selected_paths, loader_path=ckpt_state["loader_path"],
                 )
                 ckpt_state["snapshots"] = snapshots
                 ckpt_state["processed"] = True
@@ -362,11 +449,22 @@ def create_app(
             Output("ckpt-process-btn", "disabled", allow_duplicate=True),
             Output("ckpt-poll", "disabled"),
             Input("ckpt-process-btn", "n_clicks"),
+            State("ckpt-selector", "data"),
             prevent_initial_call=True,
         )
-        def _start_ckpt_processing(n_clicks):
+        def _start_ckpt_processing(n_clicks, selected_indices):
             if not n_clicks or bg_tasks["ckpt_running"]:
                 return no_update, no_update, no_update
+            
+            # Store selected checkpoint indices
+            if not selected_indices:
+                return (
+                    dbc.Alert("Please select at least one checkpoint to process.", color="warning", className="mb-0"),
+                    False,
+                    True,
+                )
+            
+            ckpt_state["selected_indices"] = [int(idx) for idx in selected_indices]
             bg_tasks["ckpt_running"] = True
             bg_tasks["ckpt_done"] = False
             bg_tasks["ckpt_error"] = None
@@ -404,6 +502,150 @@ def create_app(
                 True,
                 True,  # disable polling
             )
+
+        # ── Build checkpoint table with embedded checkboxes ────────────
+
+        @callback(
+            Output("ckpt-table-body", "children"),
+            Input("ckpt-selector", "data"),
+            Input("ckpt-filter-input", "value"),
+            prevent_initial_call=False,
+        )
+        def _build_ckpt_table(selected_value, filter_pattern):
+            """Build table rows with checkboxes for checkpoint selection."""
+            from gradienthound._dashboard._page_checkpoints import _fmt_bytes
+            
+            # Decode selection (dcc.Store stores as JSON)
+            selected_indices = set()
+            if selected_value:
+                selected_indices = set(int(v) for v in selected_value) if isinstance(selected_value, list) else {int(selected_value)}
+            
+            # Build visible rows based on filter and track visible indices
+            rows = []
+            visible_indices = []
+            for i, path in enumerate(ckpt_state["paths"]):
+                p = Path(path)
+                name = p.name
+                
+                # Apply filter if present
+                if filter_pattern:
+                    if not fnmatch(name, filter_pattern):
+                        continue
+                
+                visible_indices.append(i)
+                
+                # Build row with checkbox in first column
+                size = ""
+                if p.exists():
+                    size = _fmt_bytes(p.stat().st_size)
+                
+                status = ""
+                if ckpt_state.get("snapshots"):
+                    snap = next(
+                        (s for s in ckpt_state["snapshots"] if s["path"] == path), 
+                        None
+                    )
+                    if snap:
+                        status = f"{len(snap['weight_stats'])} params"
+                
+                rows.append(html.Tr([
+                    html.Td(
+                        dbc.Checkbox(
+                            id={"type": "ckpt-row-checkbox", "index": i},
+                            value=i in selected_indices,
+                            className="form-check-input",
+                            style={"cursor": "pointer", "marginTop": "0.25rem"},
+                        ),
+                        style={"textAlign": "center", "verticalAlign": "middle"},
+                    ),
+                    html.Td(name),
+                    html.Td(size),
+                    html.Td(dbc.Badge(status, color="success") if status else "\u2014"),
+                    html.Td(html.Code(str(path), style={"fontSize": "0.8em"})),
+                ]))
+            
+            # Store visible indices for the checkbox callback
+            ckpt_state["visible_indices"] = visible_indices
+            
+            return rows if rows else [html.Tr([html.Td("No checkpoints match filter", colSpan=5, className="text-center text-muted")])]
+
+        # ── Handle checkbox changes ────────────────────────────────────
+
+        @callback(
+            Output("ckpt-selector", "data", allow_duplicate=True),
+            Input({"type": "ckpt-row-checkbox", "index": ALL}, "value"),
+            prevent_initial_call=True,
+        )
+        def _update_selection_from_checkbox(checkbox_values):
+            """Update selection when individual checkboxes are toggled."""
+            if not ctx.triggered or not checkbox_values:
+                return no_update
+            
+            # Use visible indices to map checkbox values to checkpoint indices
+            visible_indices = ckpt_state.get("visible_indices", [])
+            if not visible_indices:
+                return no_update
+            
+            # Build new selection based on which visible checkboxes are checked
+            new_selection = []
+            for visible_idx, is_checked in zip(visible_indices, checkbox_values):
+                if is_checked:
+                    new_selection.append(str(visible_idx))
+            
+            return new_selection
+
+        # ── Filter checkpoints by pattern ────────────────────────────
+
+        @callback(
+            Output("ckpt-selector", "data", allow_duplicate=True),
+            Input("ckpt-filter-input", "value"),
+            State("ckpt-selector", "data"),
+            prevent_initial_call=True,
+        )
+        def _handle_filter_change(filter_pattern, current_selection):
+            """Maintain selection when filter changes."""
+            # Just return current selection - the table builder will handle filtering
+            return current_selection or [str(i) for i in range(len(ckpt_state["paths"]))]
+
+        # ── Update selection count display ────────────────────────────
+
+        @callback(
+            Output("ckpt-selection-count", "children"),
+            Input("ckpt-selector", "data"),
+        )
+        def _update_selection_count(selected_values):
+            """Update the display showing how many checkpoints are selected."""
+            count = len(selected_values) if selected_values else 0
+            total = len(ckpt_state["paths"])
+            if count == 0:
+                return html.Span(f"0 of {total} selected", className="text-danger fw-bold")
+            elif count == total:
+                return html.Span(f"All {total} selected", className="text-success fw-bold")
+            else:
+                return html.Span(f"{count} of {total} selected", className="text-info fw-bold")
+
+        # ── Select All / Clear checkpoint buttons ────────────────────
+
+        @callback(
+            Output("ckpt-selector", "data", allow_duplicate=True),
+            Input("ckpt-select-all-btn", "n_clicks"),
+            Input("ckpt-clear-btn", "n_clicks"),
+            prevent_initial_call=True,
+        )
+        def _toggle_ckpt_selection(select_all_clicks, clear_clicks):
+            if not ctx.triggered:
+                return no_update
+
+            button_id = ctx.triggered[0]["prop_id"].split(".")[0]
+            
+            if button_id == "ckpt-select-all-btn":
+                # Select all checkpoints
+                return [str(i) for i in range(len(ckpt_state["paths"]))]
+            elif button_id == "ckpt-clear-btn":
+                # Clear all selections
+                return []
+            
+            return no_update
 
     # ── Fetch W&B run metrics (background) ────────────────────────
 
@@ -501,13 +743,19 @@ def create_app(
         Input("url", "pathname"),
         Input("ckpt-store", "data"),
         Input("wandb-store", "data"),
+        Input("model-store", "data"),
     )
-    def _route(pathname, ckpt_data, wandb_data):
+    def _route(pathname, ckpt_data, wandb_data, model_store_data):
         snapshots = ckpt_state["snapshots"] if ckpt_state["processed"] else None
+        
+        # Use model data from store if available (for model switching), otherwise use initial model_data
+        current_model_data = model_data
+        if model_store_data and "data" in model_store_data:
+            current_model_data = model_store_data["data"]
 
         if pathname is None or pathname == "/":
-            if model_data:
-                return dashboard_page(model_data, snapshots=snapshots)
+            if current_model_data:
+                return dashboard_page(current_model_data, snapshots=snapshots)
             return landing_page_empty()
 
         if pathname == "/metrics":
@@ -531,9 +779,6 @@ def create_app(
 
         if pathname == "/weightwatcher":
             return weightwatcher_page(snapshots)
-
-        if pathname == "/live":
-            return live_page(has_ipc=ipc is not None)
 
         if pathname == "/on-demand":
             model_names = sorted(ipc.read_models().keys()) if ipc else []
@@ -1378,373 +1623,6 @@ def create_app(
         )
 
     # ══════════════════════════════════════════════════════════════════
-    # ── Live Training page callbacks ─────────────────────────────────
-    # ══════════════════════════════════════════════════════════════════
-
-    @callback(
-        Output("live-act-chart", "figure"),
-        Output("live-act-summary", "children"),
-        Output("live-act-table", "children"),
-        Input("live-refresh", "n_intervals"),
-        prevent_initial_call=True,
-    )
-    def _update_live_activations(_n):
-        import plotly.graph_objects as go
-
-        empty = go.Figure()
-        if ipc is None:
-            return empty, "No IPC channel.", ""
-
-        entries = ipc.read_activation_stats()
-        if not entries:
-            return empty, "No activation records yet.", ""
-
-        # Group by layer, get latest step for each
-        latest: dict[str, dict] = {}
-        for e in entries:
-            layer = e.get("layer", "")
-            step = e.get("step", 0)
-            if layer not in latest or step > latest[layer].get("step", -1):
-                latest[layer] = e
-
-        layers = sorted(latest.keys())
-        if not layers:
-            return empty, "No layer data.", ""
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=[short_layer(l) for l in layers],
-            y=[latest[l].get("mean", 0) for l in layers],
-            name="mean", marker_color="#375a7f",
-        ))
-        fig.add_trace(go.Bar(
-            x=[short_layer(l) for l in layers],
-            y=[latest[l].get("std", 0) for l in layers],
-            name="std", marker_color="#e67e22",
-        ))
-        fig.update_layout(
-            **plotly_layout(title="Activation Statistics (Latest Step)"),
-            barmode="group", height=420,
-            xaxis_tickangle=-45, xaxis_title="Layer", yaxis_title="Value",
-        )
-
-        summary = f"{len(entries)} records across {len(layers)} layers"
-
-        # Build raw data table (latest per layer)
-        header = [
-            html.Th("Layer"), html.Th("Step"), html.Th("Mean"),
-            html.Th("Std"), html.Th("Min"), html.Th("Max"), html.Th("Zero%"),
-        ]
-        rows = []
-        for l in layers:
-            e = latest[l]
-            zf = e.get("zero_fraction")
-            rows.append(html.Tr([
-                html.Td(html.Code(short_layer(l))),
-                html.Td(str(e.get("step", ""))),
-                html.Td(f"{e.get('mean', 0):.4g}"),
-                html.Td(f"{e.get('std', 0):.4g}"),
-                html.Td(f"{e.get('min', 0):.4g}"),
-                html.Td(f"{e.get('max', 0):.4g}"),
-                html.Td(f"{zf * 100:.1f}" if zf is not None else "-"),
-            ]))
-
-        table = html.Div(
-            dbc.Table([
-                html.Thead(html.Tr(header)),
-                html.Tbody(rows),
-            ], bordered=True, hover=True, responsive=True, size="sm"),
-            style={"maxHeight": "500px", "overflowY": "auto"},
-        )
-        return fig, summary, table
-
-    @callback(
-        Output("live-weight-chart", "figure"),
-        Output("live-weight-summary", "children"),
-        Output("live-weight-table", "children"),
-        Input("live-refresh", "n_intervals"),
-        prevent_initial_call=True,
-    )
-    def _update_live_weights(_n):
-        import plotly.graph_objects as go
-
-        empty = go.Figure()
-        if ipc is None:
-            return empty, "No IPC channel.", ""
-
-        entries = ipc.read_weight_stats()
-        if not entries:
-            return empty, "No weight stat records yet.", ""
-
-        # Group by layer, collect time series
-        by_layer: dict[str, list[dict]] = {}
-        for e in entries:
-            layer = e.get("layer", "")
-            by_layer.setdefault(layer, []).append(e)
-
-        layers = sorted(by_layer.keys())
-        if not layers:
-            return empty, "No layers.", ""
-
-        # Show latest snapshot as bar chart
-        latest: dict[str, dict] = {}
-        for l in layers:
-            latest[l] = max(by_layer[l], key=lambda e: e.get("step", 0))
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=[short_layer(l) for l in layers if not l.endswith(".bias")],
-            y=[latest[l].get("norm_l2", 0) for l in layers if not l.endswith(".bias")],
-            name="L2 Norm", marker_color="#375a7f",
-        ))
-        fig.update_layout(
-            **plotly_layout(title="Live Weight L2 Norms"),
-            height=420, xaxis_tickangle=-45,
-            xaxis_title="Layer", yaxis_title="L2 Norm",
-        )
-
-        summary = f"{len(entries)} records across {len(layers)} params"
-
-        header = [
-            html.Th("Layer"), html.Th("Step"), html.Th("L2 Norm"),
-            html.Th("Mean"), html.Th("Std"), html.Th("Near-Zero%"),
-        ]
-        rows = []
-        for l in layers[:100]:
-            e = latest[l]
-            rows.append(html.Tr([
-                html.Td(html.Code(short_layer(l))),
-                html.Td(str(e.get("step", ""))),
-                html.Td(f"{e.get('norm_l2', 0):.4g}"),
-                html.Td(f"{e.get('mean', 0):.4g}"),
-                html.Td(f"{e.get('std', 0):.4g}"),
-                html.Td(f"{e.get('near_zero_pct', 0):.1f}"),
-            ]))
-
-        table = html.Div(
-            dbc.Table([
-                html.Thead(html.Tr(header)),
-                html.Tbody(rows),
-            ], bordered=True, hover=True, responsive=True, size="sm"),
-            style={"maxHeight": "500px", "overflowY": "auto"},
-        )
-        return fig, summary, table
-
-    @callback(
-        Output("live-optim-chart", "figure"),
-        Output("live-optim-summary", "children"),
-        Output("live-optim-table", "children"),
-        Input("live-refresh", "n_intervals"),
-        prevent_initial_call=True,
-    )
-    def _update_live_optimizer(_n):
-        import plotly.graph_objects as go
-
-        empty = go.Figure()
-        if ipc is None:
-            return empty, "No IPC channel.", ""
-
-        entries = ipc.read_optimizer_state()
-        if not entries:
-            return empty, "No optimizer state records yet.", ""
-
-        # Latest entry per optimizer/layer
-        latest: dict[str, dict] = {}
-        for e in entries:
-            key = e.get("optimizer", "") + "/" + e.get("layer", str(e.get("param_group", "")))
-            step = e.get("step", 0)
-            if key not in latest or step > latest[key].get("step", -1):
-                latest[key] = e
-
-        keys = sorted(latest.keys())
-        if not keys:
-            return empty, "No optimizer state data.", ""
-
-        # Bar chart of effective LR or exp_avg norms
-        fig = go.Figure()
-        elr_keys = [k for k in keys if latest[k].get("effective_lr") is not None]
-        if elr_keys:
-            fig.add_trace(go.Bar(
-                x=[short_layer(k) for k in elr_keys],
-                y=[latest[k]["effective_lr"] for k in elr_keys],
-                name="Effective LR", marker_color="#00bc8c",
-            ))
-            fig.update_layout(
-                **plotly_layout(title="Effective Learning Rate"),
-                height=380, xaxis_tickangle=-45,
-            )
-        else:
-            ean_keys = [k for k in keys if latest[k].get("exp_avg_norm_mean") is not None]
-            if ean_keys:
-                fig.add_trace(go.Bar(
-                    x=[short_layer(k) for k in ean_keys],
-                    y=[latest[k]["exp_avg_norm_mean"] for k in ean_keys],
-                    name="1st Moment Norm", marker_color="#375a7f",
-                ))
-                fig.update_layout(
-                    **plotly_layout(title="Optimizer 1st Moment Norms"),
-                    height=380, xaxis_tickangle=-45,
-                )
-
-        summary = f"{len(entries)} records, {len(keys)} groups"
-
-        header = [html.Th("Key"), html.Th("Step"), html.Th("Details")]
-        rows = []
-        for k in keys[:80]:
-            e = latest[k]
-            parts = []
-            for field in ("effective_lr", "exp_avg_norm_mean", "exp_avg_sq_mean",
-                          "warmup_pct", "bias_correction2"):
-                v = e.get(field)
-                if v is not None:
-                    parts.append(f"{field}={v:.4g}")
-            rows.append(html.Tr([
-                html.Td(html.Code(short_layer(k))),
-                html.Td(str(e.get("step", ""))),
-                html.Td(", ".join(parts) if parts else "-"),
-            ]))
-
-        table = html.Div(
-            dbc.Table([html.Thead(html.Tr(header)), html.Tbody(rows)],
-                      bordered=True, hover=True, responsive=True, size="sm"),
-            style={"maxHeight": "500px", "overflowY": "auto"},
-        )
-        return fig, summary, table
-
-    @callback(
-        Output("live-pred-scatter", "figure"),
-        Output("live-pred-summary", "children"),
-        Output("live-pred-table", "children"),
-        Input("live-refresh", "n_intervals"),
-        prevent_initial_call=True,
-    )
-    def _update_live_predictions(_n):
-        import plotly.graph_objects as go
-
-        empty = go.Figure()
-        if ipc is None:
-            return empty, "No IPC channel.", ""
-
-        entries = ipc.read_predictions()
-        if not entries:
-            return (
-                empty,
-                "No predictions logged yet. Use gradienthound.log_predictions() during training.",
-                "",
-            )
-
-        # Flatten all predicted/actual pairs
-        predicted = []
-        actual = []
-        for e in entries[-500:]:  # Last 500 entries
-            p = e.get("predicted")
-            a = e.get("actual")
-            if p is not None and a is not None:
-                if isinstance(p, list) and isinstance(a, list):
-                    predicted.extend(p)
-                    actual.extend(a)
-                else:
-                    predicted.append(float(p))
-                    actual.append(float(a))
-
-        if not predicted:
-            return empty, f"{len(entries)} entries but no valid predicted/actual pairs.", ""
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=actual, y=predicted, mode="markers",
-            marker={"size": 4, "color": "#375a7f", "opacity": 0.5},
-            name="predictions",
-            hovertemplate="actual=%{x:.4g}<br>predicted=%{y:.4g}<extra></extra>",
-        ))
-        # Perfect calibration line
-        all_vals = actual + predicted
-        lo, hi = min(all_vals), max(all_vals)
-        fig.add_trace(go.Scatter(
-            x=[lo, hi], y=[lo, hi], mode="lines",
-            line={"color": "#dc3545", "dash": "dash", "width": 1.5},
-            name="y=x",
-        ))
-        fig.update_layout(
-            **plotly_layout(title="Prediction Calibration"),
-            height=420, xaxis_title="Actual", yaxis_title="Predicted",
-        )
-
-        summary = f"{len(entries)} log entries, {len(predicted)} points plotted"
-
-        # Compute calibration stats
-        if predicted and actual:
-            residuals = [p - a for p, a in zip(predicted, actual)]
-            mae = sum(abs(r) for r in residuals) / len(residuals)
-            rmse = (sum(r ** 2 for r in residuals) / len(residuals)) ** 0.5
-            table = dbc.Table([
-                html.Tbody([
-                    html.Tr([html.Th("MAE"), html.Td(f"{mae:.6g}")]),
-                    html.Tr([html.Th("RMSE"), html.Td(f"{rmse:.6g}")]),
-                    html.Tr([html.Th("Points"), html.Td(str(len(predicted)))]),
-                ]),
-            ], bordered=True, size="sm")
-        else:
-            table = ""
-
-        return fig, summary, table
-
-    @callback(
-        Output("live-attn-heatmap", "figure"),
-        Output("live-attn-summary", "children"),
-        Output("live-attn-select", "options"),
-        Input("live-refresh", "n_intervals"),
-        Input("live-attn-select", "value"),
-        prevent_initial_call=True,
-    )
-    def _update_live_attention(_n, selected_name):
-        import plotly.graph_objects as go
-
-        empty = go.Figure()
-        if ipc is None:
-            return empty, "No IPC channel.", []
-
-        entries = ipc.read_attention()
-        if not entries:
-            return (
-                empty,
-                "No attention patterns logged yet. Use gradienthound.log_attention() during training.",
-                [],
-            )
-
-        # Collect unique attention names
-        names = sorted({e.get("name", "default") for e in entries})
-        options = [{"label": n, "value": n} for n in names]
-
-        if not selected_name or selected_name not in names:
-            selected_name = names[0]
-
-        # Get the latest entry for the selected name
-        matching = [e for e in entries if e.get("name") == selected_name]
-        if not matching:
-            return empty, f"{len(entries)} entries, none for '{selected_name}'.", options
-
-        latest = matching[-1]
-        weights = latest.get("weights")
-        if weights is None or not isinstance(weights, list):
-            return empty, "Attention entry has no weight matrix.", options
-
-        fig = go.Figure(go.Heatmap(
-            z=weights,
-            colorscale="Viridis",
-            hovertemplate="row=%{y}<br>col=%{x}<br>weight=%{z:.4g}<extra></extra>",
-        ))
-        fig.update_layout(
-            **plotly_layout(title=f"Attention \u2014 {selected_name}"),
-            height=450,
-            yaxis={"autorange": "reversed"},
-            xaxis_title="Key position",
-            yaxis_title="Query position",
-        )
-
-        summary = f"{len(entries)} entries, {len(names)} heads, showing: {selected_name}"
-        return fig, summary, options
-
     # ══════════════════════════════════════════════════════════════════
     # ── On-Demand Analysis page callbacks ────────────────────────────
     # ══════════════════════════════════════════════════════════════════

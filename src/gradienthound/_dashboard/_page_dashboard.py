@@ -28,6 +28,33 @@ def _fmt_bytes(n: int | float) -> str:
     return f"{n:.1f} TB"
 
 
+def _split_model_data_for_submodel(
+    model_data: dict, stats: list[dict], sub_model: str,
+) -> tuple[dict, list[dict]]:
+    """Extract model_data and weight stats for a single sub-model.
+
+    Returns a model_data dict with only modules/params under the sub-model
+    prefix, and the corresponding weight stat entries.
+    """
+    mt = model_data.get("module_tree", {})
+    # Filter modules belonging to this sub-model
+    sm_modules = [
+        m for m in mt.get("modules", [])
+        if m["path"].startswith(sub_model + ".")
+    ]
+    # Find the root of this sub-model's subtree
+    sm_root_path = f"{sub_model}.{sub_model}"
+    sm_root = next((m for m in sm_modules if m["path"] == sm_root_path), None)
+    sm_model_data = dict(model_data)
+    sm_model_data["module_tree"] = {
+        "name": sm_root_path if sm_root else sub_model,
+        "modules": sm_modules,
+    }
+    # Filter stats to this sub-model
+    sm_stats = [s for s in stats if s["layer"].startswith(sub_model + ".")]
+    return sm_model_data, sm_stats
+
+
 def _build_live_analysis_sections(live: dict, model_data: dict) -> list:
     """Build dashboard sections for live-model analyses (FLOPs, activations, pruning)."""
     import plotly.graph_objects as go
@@ -401,54 +428,110 @@ def dashboard_page(model_data: dict, snapshots: list | None = None):
     # ── 3. Architecture graph (health-colored when snapshots, plain otherwise)
     if snapshots:
         latest_stats = snapshots[-1]["weight_stats"]
-        health_elements = build_health_elements(model_data, latest_stats)
-        if health_elements:
-            health_style = CYTO_STYLE + [
-                {"selector": f".health-{state}", "style": {
-                    "background-color": color,
-                    "border-color": color,
-                    "border-width": "2.5px" if state in ("critical", "warning") else "1.5px",
-                }}
-                for state, color in HEALTH_COLORS.items()
-            ]
-            children.append(dbc.Card(dbc.CardBody([
-                html.H5("Architecture Health Map", className="card-title"),
-                html.P(
-                    "Module health derived from weight statistics. "
-                    "Worst parameter determines module color.",
-                    className="text-muted",
-                ),
-                html.Div([
-                    html.Span([
-                        html.Span(
-                            "",
-                            style={
-                                "display": "inline-block", "width": "14px",
-                                "height": "14px", "borderRadius": "3px",
-                                "backgroundColor": color, "marginRight": "6px",
-                                "verticalAlign": "middle",
+        health_style = CYTO_STYLE + [
+            {"selector": f".health-{state}", "style": {
+                "background-color": color,
+                "border-color": color,
+                "border-width": "2.5px" if state in ("critical", "warning") else "1.5px",
+            }}
+            for state, color in HEALTH_COLORS.items()
+        ]
+
+        sub_models = model_data.get("sub_models")
+        if sub_models:
+            # Multi-model: render each sub-model as a separate graph
+            health_graphs: list = []
+            for sm_idx, sm_name in enumerate(sub_models):
+                sm_model_data, sm_stats = _split_model_data_for_submodel(
+                    model_data, latest_stats, sm_name,
+                )
+                sm_elements = build_health_elements(sm_model_data, sm_stats)
+                if sm_elements:
+                    health_graphs.append(html.Div([
+                        html.H6(sm_name, className="mt-2 mb-1"),
+                        cyto.Cytoscape(
+                            id=f"gh-cyto-health-{sm_idx}",
+                            elements=sm_elements,
+                            layout={
+                                "name": "dagre", "rankDir": "LR",
+                                "spacingFactor": 1.3, "nodeSep": 30, "rankSep": 50,
                             },
+                            stylesheet=health_style,
+                            style={"width": "100%", "height": "200px", "borderRadius": "8px"},
+                            boxSelectionEnabled=False,
+                            userZoomingEnabled=True,
+                            userPanningEnabled=True,
                         ),
-                        html.Span(label.title(), style={"marginRight": "16px"}),
-                    ])
-                    for label, color in HEALTH_COLORS.items()
-                    if label != "neutral"
-                ], className="mb-3"),
-                cyto.Cytoscape(
-                    id="gh-cyto-health",
-                    elements=health_elements,
-                    layout={
-                        "name": "dagre", "rankDir": "TB",
-                        "spacingFactor": 1.4, "nodeSep": 40, "rankSep": 60,
-                    },
-                    stylesheet=health_style,
-                    style={"width": "100%", "height": "420px", "borderRadius": "8px"},
-                    boxSelectionEnabled=False,
-                    userZoomingEnabled=True,
-                    userPanningEnabled=True,
-                ),
-                html.Div(id="ns-layer-detail", className="mt-3"),
-            ]), className="mb-3"))
+                    ]))
+            if health_graphs:
+                children.append(dbc.Card(dbc.CardBody([
+                    html.H5("Architecture Health Map", className="card-title"),
+                    html.P(
+                        "Module health derived from weight statistics. "
+                        "Worst parameter determines module color.",
+                        className="text-muted",
+                    ),
+                    html.Div([
+                        html.Span([
+                            html.Span(
+                                "",
+                                style={
+                                    "display": "inline-block", "width": "14px",
+                                    "height": "14px", "borderRadius": "3px",
+                                    "backgroundColor": color, "marginRight": "6px",
+                                    "verticalAlign": "middle",
+                                },
+                            ),
+                            html.Span(label.title(), style={"marginRight": "16px"}),
+                        ])
+                        for label, color in HEALTH_COLORS.items()
+                        if label != "neutral"
+                    ], className="mb-3"),
+                    *health_graphs,
+                    html.Div(id="ns-layer-detail", className="mt-3"),
+                ]), className="mb-3"))
+        else:
+            # Single model
+            health_elements = build_health_elements(model_data, latest_stats)
+            if health_elements:
+                children.append(dbc.Card(dbc.CardBody([
+                    html.H5("Architecture Health Map", className="card-title"),
+                    html.P(
+                        "Module health derived from weight statistics. "
+                        "Worst parameter determines module color.",
+                        className="text-muted",
+                    ),
+                    html.Div([
+                        html.Span([
+                            html.Span(
+                                "",
+                                style={
+                                    "display": "inline-block", "width": "14px",
+                                    "height": "14px", "borderRadius": "3px",
+                                    "backgroundColor": color, "marginRight": "6px",
+                                    "verticalAlign": "middle",
+                                },
+                            ),
+                            html.Span(label.title(), style={"marginRight": "16px"}),
+                        ])
+                        for label, color in HEALTH_COLORS.items()
+                        if label != "neutral"
+                    ], className="mb-3"),
+                    cyto.Cytoscape(
+                        id="gh-cyto-health",
+                        elements=health_elements,
+                        layout={
+                            "name": "dagre", "rankDir": "TB",
+                            "spacingFactor": 1.4, "nodeSep": 40, "rankSep": 60,
+                        },
+                        stylesheet=health_style,
+                        style={"width": "100%", "height": "420px", "borderRadius": "8px"},
+                        boxSelectionEnabled=False,
+                        userZoomingEnabled=True,
+                        userPanningEnabled=True,
+                    ),
+                    html.Div(id="ns-layer-detail", className="mt-3"),
+                ]), className="mb-3"))
 
         # ── 4. Top Anomalies (checkpoint transition events) ─────────
         ranked_events: list[dict] = []
