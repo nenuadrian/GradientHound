@@ -1,20 +1,11 @@
-# GradientHound
+# Docs Home
 
-A toolkit for capturing training telemetry from PyTorch models and exploring architecture, gradients, and optimizer state in a live dashboard.
+This file is auto-generated from README.md by scripts/sync_readme_to_docs.py.
 
-## Highlights
-
-- Live metric and gradient capture during training
-- Model graph export with shape and dtype metadata
-- Standalone dashboard for online and offline inspection
-- Optional wandb capture integration
-
-## Quick Install
+If you are viewing this in the repository, run:
 
 ```bash
-pip install gradienthound
+python scripts/sync_readme_to_docs.py
 ```
 
-## Docs
-
-Use the project README for the complete quick start and API examples.
+The GitHub Actions docs workflow also runs this step automatically before building MkDocs.
