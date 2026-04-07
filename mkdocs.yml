@@ -1,0 +1,32 @@
+site_name: GradientHound
+site_description: PyTorch training telemetry and model graph inspection
+site_url: https://nenuadrian.github.io/GradientHound/
+repo_name: nenuadrian/GradientHound
+repo_url: https://github.com/nenuadrian/GradientHound
+
+nav:
+  - Home: index.md
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.tabs
+    - navigation.top
+    - content.code.copy
+  palette:
+    - scheme: slate
+      primary: black
+      accent: lime
+  font:
+    text: Fira Sans
+    code: Fira Code
+
+markdown_extensions:
+  - admonition
+  - codehilite
+  - toc:
+      permalink: true
+
+extra_css:
+  - assets/stylesheets/extra.css
