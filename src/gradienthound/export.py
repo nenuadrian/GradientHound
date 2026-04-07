@@ -13,12 +13,14 @@ Usage::
     sample = (torch.randn(1, 3, 224, 224),)
     gradienthound.export_model(model, sample, "model.gh.json")
 """
+
 from __future__ import annotations
 
 import json
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from fvcore.nn import FlopCountAnalysis
 
 if TYPE_CHECKING:
     import torch
@@ -28,6 +30,7 @@ FORMAT_VERSION = "1.0"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────
+
 
 def _tensor_meta(val: Any) -> dict | list | None:
     """Extract shape/dtype from a FakeTensor, real Tensor, or nested structure."""
@@ -93,9 +96,14 @@ def _nn_module_path(node) -> tuple[str | None, str | None]:
     # The last entry is the innermost module.
     last_key = list(stack.keys())[-1]
     qualname, mod_type = stack[last_key]
-    type_str = mod_type if isinstance(mod_type, str) else (
-        f"{mod_type.__module__}.{mod_type.__qualname__}"
-        if hasattr(mod_type, "__qualname__") else str(mod_type)
+    type_str = (
+        mod_type
+        if isinstance(mod_type, str)
+        else (
+            f"{mod_type.__module__}.{mod_type.__qualname__}"
+            if hasattr(mod_type, "__qualname__")
+            else str(mod_type)
+        )
     )
     return qualname, type_str
 
@@ -113,6 +121,7 @@ def _source_fn(node) -> str | None:
 
 
 # ── Parameter collection ──────────────────────────────────────────────
+
 
 def _collect_parameters(model: nn.Module) -> dict[str, dict]:
     """Collect shape/dtype/device metadata for every parameter and buffer."""
@@ -138,6 +147,7 @@ def _collect_parameters(model: nn.Module) -> dict[str, dict]:
 
 
 # ── FX graph extraction ──────────────────────────────────────────────
+
 
 def _extract_fx_graph(exported) -> dict:
     """Walk the exported FX graph and return nodes + edges."""
@@ -193,6 +203,7 @@ def _extract_fx_graph(exported) -> dict:
 
 # ── Graph signature ──────────────────────────────────────────────────
 
+
 def _extract_signature(exported) -> dict:
     """Extract the graph signature: params, buffers, user inputs/outputs."""
     sig = exported.graph_signature
@@ -211,14 +222,18 @@ def _extract_signature(exported) -> dict:
         elif kind == "BUFFER":
             buffers.append(target)
         elif kind == "USER_INPUT":
-            user_inputs.append(spec.arg.name if hasattr(spec.arg, "name") else str(spec.arg))
+            user_inputs.append(
+                spec.arg.name if hasattr(spec.arg, "name") else str(spec.arg)
+            )
 
     # Output spec
     user_outputs = []
     for spec in sig.output_specs:
         kind = spec.kind.name
         if kind == "USER_OUTPUT":
-            user_outputs.append(spec.arg.name if hasattr(spec.arg, "name") else str(spec.arg))
+            user_outputs.append(
+                spec.arg.name if hasattr(spec.arg, "name") else str(spec.arg)
+            )
 
     result["parameters"] = params
     result["buffers"] = buffers
@@ -230,26 +245,146 @@ def _extract_signature(exported) -> dict:
 
 # ── Input / output specs from example tensors ────────────────────────
 
+
 def _input_specs(example_inputs: tuple) -> list[dict]:
     import torch
+
     specs = []
     for i, inp in enumerate(example_inputs):
         if isinstance(inp, torch.Tensor):
-            specs.append({
-                "name": f"input_{i}",
-                "shape": list(inp.shape),
-                "dtype": str(inp.dtype).removeprefix("torch."),
-            })
+            specs.append(
+                {
+                    "name": f"input_{i}",
+                    "shape": list(inp.shape),
+                    "dtype": str(inp.dtype).removeprefix("torch."),
+                }
+            )
     return specs
 
 
+# ── Live-model analyses ──────────────────────────────────────────────
+
+
+def _fvcore_analysis(model: nn.Module, example_inputs: tuple) -> dict[str, Any] | None:
+    """Run fvcore FLOPs/parameter analysis.  Returns None if fvcore is missing."""
+
+    flops = FlopCountAnalysis(model, example_inputs)
+    # Silence unsupported-op warnings (e.g. aten::tanh) — they still count as 0.
+    flops.unsupported_ops_warnings(False)
+    flops.uncalled_modules_warnings(False)
+
+    by_module = {k: v for k, v in flops.by_module().items() if k}
+    by_operator = dict(flops.by_operator())
+
+    return {
+        "total_flops": flops.total(),
+        "by_module": by_module,
+        "by_operator": by_operator,
+        "unsupported_ops": dict(flops.unsupported_ops()),
+    }
+
+
+def _pruning_analysis(
+    model: nn.Module, example_inputs: tuple
+) -> list[dict[str, Any]] | None:
+    """Run Torch-Pruning dependency analysis.  Returns None if not installed."""
+    try:
+        import torch_pruning as tp
+    except ImportError:
+        return None
+
+    DG = tp.DependencyGraph()
+    DG.build_dependency(model, example_inputs=example_inputs)
+
+    groups: list[dict[str, Any]] = []
+    for group in DG.get_all_groups():
+        coupled: list[str] = []
+        for dep, _idxs in group:
+            src = dep.source.name
+            tgt = dep.target.name
+            if src not in coupled:
+                coupled.append(src)
+            if tgt not in coupled:
+                coupled.append(tgt)
+        prunable_dims = len(group[0][1]) if group else 0
+        groups.append(
+            {
+                "coupled_layers": coupled,
+                "n_prunable": prunable_dims,
+            }
+        )
+
+    return groups
+
+
+def _activation_analysis(
+    model: nn.Module, example_inputs: tuple
+) -> dict[str, dict] | None:
+    """Capture per-module activation shapes and memory via forward hooks."""
+    import torch
+
+    activations: dict[str, dict] = {}
+
+    def _hook(name: str):
+        def fn(_module, _input, output):
+            if isinstance(output, torch.Tensor):
+                activations[name] = {
+                    "shape": list(output.shape),
+                    "numel": output.numel(),
+                    "bytes": output.numel() * output.element_size(),
+                    "dtype": str(output.dtype).removeprefix("torch."),
+                }
+
+        return fn
+
+    handles = []
+    for name, mod in model.named_modules():
+        if name:
+            handles.append(mod.register_forward_hook(_hook(name)))
+
+    try:
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            model(*example_inputs)
+        model.train(was_training)
+    except Exception:
+        pass
+    finally:
+        for h in handles:
+            h.remove()
+
+    return activations if activations else None
+
+
+def _run_live_analyses(model: nn.Module, example_inputs: tuple) -> dict[str, Any]:
+    """Run all available live-model analyses and return combined results."""
+    result: dict[str, Any] = {}
+
+    flops = _fvcore_analysis(model, example_inputs)
+    if flops is not None:
+        result["flops"] = flops
+
+    pruning = _pruning_analysis(model, example_inputs)
+    if pruning is not None:
+        result["pruning_groups"] = pruning
+
+    activations = _activation_analysis(model, example_inputs)
+    if activations is not None:
+        result["activations"] = activations
+
+    return result
+
+
 # ── Public API ────────────────────────────────────────────────────────
+
 
 def export_model(
     model: nn.Module,
     example_inputs: tuple,
     output: str | Path | None = None,
     *,
+    name: str | None = None,
     dynamic_shapes: dict | None = None,
     strict: bool = True,
 ) -> dict:
@@ -261,6 +396,8 @@ def export_model(
             to ``model(*example_inputs)``).
         output: Optional file path.  When given, the descriptor is written as
             JSON to this path (conventionally ``*.gh.json``).
+        name: Optional human-readable name for the model (e.g. ``"actor"``).
+            Defaults to ``type(model).__name__``.
         dynamic_shapes: Passed through to ``torch.export.export()`` for
             symbolic shape constraints.
         strict: Passed through to ``torch.export.export()``.  Set ``False``
@@ -273,7 +410,7 @@ def export_model(
 
     from gradienthound.graph import extract_model_graph
 
-    model_name = type(model).__name__
+    model_name = name or type(model).__name__
     model_class = f"{type(model).__module__}.{type(model).__qualname__}"
 
     # ── Step 1: module tree (always works) ────────────────────────────
@@ -326,21 +463,28 @@ def export_model(
             if node["op"] == "output" and node.get("outputs"):
                 descriptor["outputs"] = node["outputs"]
             elif node["op"] == "output" and node.get("output_shape"):
-                descriptor["outputs"] = [{
-                    "shape": node["output_shape"],
-                    "dtype": node.get("output_dtype", "unknown"),
-                }]
+                descriptor["outputs"] = [
+                    {
+                        "shape": node["output_shape"],
+                        "dtype": node.get("output_dtype", "unknown"),
+                    }
+                ]
 
     # Also try to get outputs from user_output nodes
     if not descriptor["outputs"] and fx_graph:
         for node in fx_graph["nodes"]:
             if node["name"] in (graph_signature or {}).get("user_outputs", []):
                 if node.get("output_shape"):
-                    descriptor["outputs"].append({
-                        "name": node["name"],
-                        "shape": node["output_shape"],
-                        "dtype": node.get("output_dtype", "unknown"),
-                    })
+                    descriptor["outputs"].append(
+                        {
+                            "name": node["name"],
+                            "shape": node["output_shape"],
+                            "dtype": node.get("output_dtype", "unknown"),
+                        }
+                    )
+
+    # ── Step 4b: live-model analyses (fvcore, Torch-Pruning, activations) ─
+    descriptor["live_analysis"] = _run_live_analyses(model, example_inputs)
 
     # ── Step 5: serialize ─────────────────────────────────────────────
     if output is not None:

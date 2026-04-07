@@ -25,8 +25,12 @@ SERIES_COLORS = [
 PAGES = {
     "/":               ("Dashboard",      "Model overview, weights, gradients, and health"),
     "/gradient-flow":  ("Gradient Flow",  "Gradient magnitudes across layers"),
+    "/live":           ("Live Training",  "Activations, weights, optimizer state, predictions, attention"),
     "/metrics":        ("Metrics",        "Run metrics from Weights & Biases"),
     "/checkpoints":    ("Checkpoints",    "Compare model checkpoints"),
+    "/weightwatcher":  ("WeightWatcher",  "Spectral analysis deep-dive"),
+    "/on-demand":      ("On-Demand",      "Weight heatmaps, CKA similarity, network state"),
+    "/raw-data":       ("Raw Data",       "Browse raw captured IPC data"),
 }
 
 # ── Plotly light template ────────────────────────────────────────────

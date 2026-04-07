@@ -60,12 +60,50 @@ def checkpoints_page(ckpt_paths: list[str], snapshots: list[dict] | None):
             html.Strong(f"Processed \u2014 {len(snapshots)} checkpoints, {n_params} parameters. "),
             "Head back to the Dashboard to explore weight analysis, health charts, and optimizer metrics.",
         ], color="success", className="mb-3"))
+
+        latest = snapshots[-1]
+        latest_stats = latest.get("weight_stats", [])
+        spectral_stats = [
+            s for s in latest_stats
+            if any(k in s for k in ("alpha", "alpha_weighted", "mp_softrank", "num_spikes", "log_spectral_norm"))
+        ]
+        if spectral_stats:
+            def _avg(key: str) -> str:
+                vals = [float(s[key]) for s in spectral_stats if isinstance(s.get(key), (int, float))]
+                if not vals:
+                    return "\u2014"
+                return f"{sum(vals) / len(vals):.4g}"
+
+            rows = [
+                ("Layers with spectral stats", str(len(spectral_stats))),
+                ("Alpha (mean)", _avg("alpha")),
+                ("Alpha Weighted (mean)", _avg("alpha_weighted")),
+                ("MP Softrank (mean)", _avg("mp_softrank")),
+                ("Spikes (mean)", _avg("num_spikes")),
+                ("log10(lambda_max) (mean)", _avg("log_spectral_norm")),
+                ("MP Edge lambda+ (mean)", _avg("lambda_plus")),
+            ]
+            children.append(dbc.Card(dbc.CardBody([
+                html.H5(f"WeightWatcher Snapshot Summary ({latest.get('name', 'latest')})", className="card-title"),
+                html.P(
+                    "Curated summary from the most recent checkpoint. Full per-layer tables and ESD "
+                    "drill-down are available on the Dashboard page.",
+                    className="text-muted",
+                ),
+                dbc.Table([
+                    html.Tbody([
+                        html.Tr([html.Th(label), html.Td(value)])
+                        for label, value in rows
+                    ]),
+                ], bordered=True, hover=True, size="sm", className="mb-0"),
+            ]), className="mb-3"))
     else:
         children.append(dbc.Card(dbc.CardBody([
             html.H5("Process", className="card-title"),
             html.P(
                 "Load all checkpoints and compute per-parameter weight statistics "
-                "(norms, distributions, SVD, kurtosis). This may take a moment for large models.",
+                "(norms, distributions, SVD, kurtosis). This runs in the background "
+                "\u2014 you can navigate to other pages while it processes.",
                 className="text-muted",
             ),
             dbc.Button("Process Checkpoints", id="ckpt-process-btn", color="primary", n_clicks=0),

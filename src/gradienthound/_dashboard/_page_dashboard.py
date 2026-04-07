@@ -12,11 +12,312 @@ from ._helpers import (
     plotly_layout, fmt_num, module_category, short_layer,
     compute_checkpoint_change_tables,
     render_checkpoint_change_table, compute_effective_rank_table,
-    compute_distribution_stats_table,
+    compute_distribution_stats_table, compute_scalar_metric_tables,
 )
 from ._graph import build_fx_elements, build_module_tree_elements
 from ._health import weight_health, build_health_elements
 from ._page_checkpoints import _optimizer_state_cards
+
+
+def _fmt_bytes(n: int | float) -> str:
+    """Format byte count as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}" if n != int(n) else f"{int(n)} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _build_live_analysis_sections(live: dict, model_data: dict) -> list:
+    """Build dashboard sections for live-model analyses (FLOPs, activations, pruning)."""
+    import plotly.graph_objects as go
+
+    sections: list = []
+    if not live:
+        return sections
+
+    sub_models = model_data.get("sub_models", [])
+    # Color palette for sub-models
+    _SM_COLORS = ["#375a7f", "#e67e22", "#00bc8c", "#e74c3c", "#9b59b6",
+                  "#3498db", "#1abc9c", "#f39c12", "#c0392b", "#8e44ad"]
+
+    def _sub_model_of(module_name: str) -> str | None:
+        """Return the sub-model prefix a module belongs to, or None."""
+        for sm in sub_models:
+            if module_name.startswith(sm + ".") or module_name == sm:
+                return sm
+        return None
+
+    def _sm_color(sm: str | None) -> str:
+        if sm is None or not sub_models:
+            return _SM_COLORS[0]
+        idx = sub_models.index(sm) if sm in sub_models else 0
+        return _SM_COLORS[idx % len(_SM_COLORS)]
+
+    # ── FLOPs breakdown ──────────────────────────────────────────────
+    flops_data = live.get("flops")
+    if flops_data:
+        by_module = flops_data.get("by_module", {})
+        by_operator = flops_data.get("by_operator", {})
+        unsupported = flops_data.get("unsupported_ops", {})
+
+        flops_children: list = []
+
+        # Per-module bar chart (colored by sub-model when multiple)
+        if by_module:
+            sorted_mods = sorted(by_module.items(), key=lambda kv: kv[1], reverse=True)
+            mod_names = [short_layer(m) for m, _ in sorted_mods]
+            mod_flops = [f for _, f in sorted_mods]
+            bar_colors = [_sm_color(_sub_model_of(m)) for m, _ in sorted_mods]
+
+            fig = go.Figure(go.Bar(
+                x=mod_names, y=mod_flops,
+                marker_color=bar_colors,
+                hovertemplate="%{x}<br>%{y:,.0f} FLOPs<extra></extra>",
+            ))
+            fig.update_layout(
+                **plotly_layout(title="FLOPs per Module"),
+                height=340,
+                xaxis_title="Module",
+                yaxis_title="FLOPs",
+                xaxis_tickangle=-45,
+            )
+            flops_children.append(dcc.Graph(figure=fig, config={"displayModeBar": False}))
+
+        # Per-sub-model FLOPs summary (only when multiple models)
+        if sub_models and by_module:
+            sm_flops: dict[str, int] = {sm: 0 for sm in sub_models}
+            for mod, count in by_module.items():
+                sm = _sub_model_of(mod)
+                if sm:
+                    sm_flops[sm] += count
+            sm_rows = []
+            total = flops_data.get("total_flops", 1)
+            for sm in sub_models:
+                pct = sm_flops[sm] / max(total, 1) * 100
+                sm_rows.append(html.Tr([
+                    html.Td([
+                        html.Span("", style={
+                            "display": "inline-block", "width": "12px", "height": "12px",
+                            "borderRadius": "2px", "backgroundColor": _sm_color(sm),
+                            "marginRight": "8px", "verticalAlign": "middle",
+                        }),
+                        html.Strong(sm),
+                    ]),
+                    html.Td(fmt_num(sm_flops[sm])),
+                    html.Td(f"{pct:.1f}%"),
+                ]))
+            flops_children.append(
+                html.H6("Per Network", className="mt-3 mb-2"),
+            )
+            flops_children.append(
+                dbc.Table([
+                    html.Thead(html.Tr([html.Th("Network"), html.Th("FLOPs"), html.Th("% Total")])),
+                    html.Tbody(sm_rows),
+                ], bordered=True, hover=True, size="sm"),
+            )
+
+        # Operator + unsupported summary
+        op_items: list = []
+        if by_operator:
+            for op, count in sorted(by_operator.items(), key=lambda kv: kv[1], reverse=True):
+                op_items.append(html.Tr([
+                    html.Td(html.Code(op)),
+                    html.Td(f"{count:,}"),
+                ]))
+        if unsupported:
+            for op, count in unsupported.items():
+                op_items.append(html.Tr([
+                    html.Td([html.Code(op), " ", dbc.Badge("unsupported", color="warning", className="ms-1")]),
+                    html.Td(f"{count}×"),
+                ]))
+        if op_items:
+            flops_children.append(
+                dbc.Row([
+                    dbc.Col([
+                        html.H6("By Operator", className="mt-3 mb-2"),
+                        dbc.Table([
+                            html.Thead(html.Tr([html.Th("Operator"), html.Th("FLOPs / Count")])),
+                            html.Tbody(op_items),
+                        ], bordered=True, hover=True, size="sm"),
+                    ], md=6),
+                ]),
+            )
+
+        sections.append(dbc.Card(dbc.CardBody([
+            html.H5([
+                "FLOPs Analysis",
+                dbc.Badge(fmt_num(flops_data.get("total_flops", 0)), color="primary", className="ms-2"),
+            ], className="card-title"),
+            html.P(
+                "Forward-pass floating-point operations per module (fvcore).",
+                className="text-muted",
+            ),
+            *flops_children,
+        ]), className="mb-3"))
+
+    # ── Activation memory ────────────────────────────────────────────
+    activations_data = live.get("activations")
+    if activations_data:
+        sorted_acts = sorted(
+            activations_data.items(),
+            key=lambda kv: kv[1].get("bytes", 0),
+            reverse=True,
+        )
+
+        # Bar chart of activation memory per module
+        act_names = [short_layer(name) for name, _ in sorted_acts]
+        act_bytes = [info.get("bytes", 0) for _, info in sorted_acts]
+        act_colors = [_sm_color(_sub_model_of(name)) for name, _ in sorted_acts]
+
+        fig = go.Figure(go.Bar(
+            x=act_names, y=act_bytes,
+            marker_color=act_colors,
+            hovertemplate="%{x}<br>%{y:,.0f} bytes<extra></extra>",
+        ))
+        fig.update_layout(
+            **plotly_layout(title="Activation Memory per Module"),
+            height=340,
+            xaxis_title="Module",
+            yaxis_title="Bytes",
+            xaxis_tickangle=-45,
+        )
+
+        total_bytes = sum(act_bytes)
+
+        # Detail table
+        act_rows = []
+        for name, info in sorted_acts:
+            shape = info.get("shape", [])
+            shape_str = "×".join(str(s) for s in shape) if shape else ""
+            pct = info.get("bytes", 0) / max(total_bytes, 1) * 100
+            act_rows.append(html.Tr([
+                html.Td(html.Code(short_layer(name))),
+                html.Td(html.Code(shape_str)),
+                html.Td(info.get("dtype", "")),
+                html.Td(f"{info.get('numel', 0):,}"),
+                html.Td(_fmt_bytes(info.get("bytes", 0))),
+                html.Td(f"{pct:.1f}%"),
+            ]))
+
+        sections.append(dbc.Card(dbc.CardBody([
+            html.H5([
+                "Activation Memory",
+                dbc.Badge(_fmt_bytes(total_bytes), color="success", className="ms-2"),
+            ], className="card-title"),
+            html.P(
+                "Per-module output tensor sizes from a single forward pass. "
+                "Peak training memory includes activations for all layers simultaneously.",
+                className="text-muted",
+            ),
+            dcc.Graph(figure=fig, config={"displayModeBar": False}),
+            html.Div(
+                dbc.Table([
+                    html.Thead(html.Tr([
+                        html.Th("Module"), html.Th("Shape"), html.Th("Dtype"),
+                        html.Th("Elements"), html.Th("Size"), html.Th("% Total"),
+                    ])),
+                    html.Tbody(act_rows),
+                ], bordered=True, hover=True, responsive=True, size="sm"),
+                style={"maxHeight": "400px", "overflowY": "auto"},
+            ),
+        ]), className="mb-3"))
+
+    # ── Pruning dependency groups ────────────────────────────────────
+    pruning_groups = live.get("pruning_groups")
+    if pruning_groups:
+        group_cards: list = []
+        # Sort by n_prunable descending for visual priority
+        sorted_groups = sorted(
+            enumerate(pruning_groups),
+            key=lambda ig: ig[1].get("n_prunable", 0),
+            reverse=True,
+        )
+        for idx, group in sorted_groups:
+            coupled = group.get("coupled_layers", [])
+            n_prunable = group.get("n_prunable", 0)
+            sub_model = group.get("sub_model")
+            # Filter to named modules (skip internal _ElementWiseOp etc.)
+            named_layers = [l for l in coupled if not l.startswith("_")]
+
+            items = [
+                html.Code(l, className="d-block", style={"fontSize": "0.85em"})
+                for l in (named_layers or coupled)
+            ]
+            title_parts = [f"Group {idx}"]
+            if sub_model:
+                title_parts.append(dbc.Badge(
+                    sub_model, className="ms-2",
+                    style={"backgroundColor": _sm_color(sub_model)},
+                ))
+            title_parts.append(dbc.Badge(f"{n_prunable} ch", color="info", className="ms-1"))
+            group_cards.append(dbc.Col(dbc.Card(dbc.CardBody([
+                html.H6(title_parts, className="card-title mb-2"),
+                *items,
+                html.Small(
+                    f"{len(coupled)} coupled ops total",
+                    className="text-muted d-block mt-2",
+                ) if len(coupled) > len(named_layers) else None,
+            ]), color="light"), md=4, className="mb-2"))
+
+        sections.append(dbc.Card(dbc.CardBody([
+            html.H5([
+                "Pruning Groups",
+                dbc.Badge(f"{len(pruning_groups)} groups", color="info", className="ms-2"),
+            ], className="card-title"),
+            html.P(
+                "Coupled layer groups from Torch-Pruning dependency analysis. "
+                "Layers within a group must be pruned together to maintain consistency.",
+                className="text-muted",
+            ),
+            dbc.Row(group_cards),
+        ]), className="mb-3"))
+
+    return sections
+
+
+def _column_summary(table: list[list[float | None]], n_cols: int):
+    """Return (means, mins, maxs) lists for each column of a metric table."""
+    means: list[float | None] = []
+    mins: list[float | None] = []
+    maxs: list[float | None] = []
+    for ci in range(n_cols):
+        col = [row[ci] for row in table if ci < len(row) and row[ci] is not None]
+        if col:
+            means.append(sum(col) / len(col))
+            mins.append(min(col))
+            maxs.append(max(col))
+        else:
+            means.append(None)
+            mins.append(None)
+            maxs.append(None)
+    return means, mins, maxs
+
+
+def _summary_chart(checkpoint_names, means, mins, maxs, title, y_label):
+    """Build a mean/min/max summary line chart."""
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=checkpoint_names, y=means, mode="lines+markers",
+        name="mean", line={"color": "#375a7f", "width": 2.5},
+    ))
+    if any(v is not None for v in maxs):
+        fig.add_trace(go.Scatter(
+            x=checkpoint_names, y=maxs, mode="lines",
+            name="max", line={"color": "#e67e22", "dash": "dot"},
+        ))
+    if any(v is not None for v in mins):
+        fig.add_trace(go.Scatter(
+            x=checkpoint_names, y=mins, mode="lines",
+            name="min", line={"color": "#00bc8c", "dash": "dot"},
+        ))
+    fig.update_layout(
+        **plotly_layout(title=title), height=320,
+        xaxis_title="Checkpoint", yaxis_title=y_label,
+    )
+    return fig
 
 
 # ── Dashboard page ───────────────────────────────────────────────────
@@ -42,6 +343,7 @@ def dashboard_page(model_data: dict, snapshots: list | None = None):
 
     params = model_data.get("parameters", {})
     buffer_count = sum(1 for p in params.values() if p.get("is_buffer"))
+    live = model_data.get("live_analysis", {})
 
     # ── 1. Stat cards ────────────────────────────────────────────────
     stat_items = [
@@ -51,6 +353,13 @@ def dashboard_page(model_data: dict, snapshots: list | None = None):
         ("FX Ops", str(len(ops))),
         ("Buffers", str(buffer_count)),
     ]
+    flops_data = live.get("flops")
+    if flops_data:
+        stat_items.append(("FLOPs", fmt_num(flops_data.get("total_flops", 0))))
+    activations_data = live.get("activations")
+    if activations_data:
+        total_act_bytes = sum(a.get("bytes", 0) for a in activations_data.values())
+        stat_items.append(("Act. Memory", _fmt_bytes(total_act_bytes)))
     if snapshots:
         stat_items.append(("Checkpoints", str(len(snapshots))))
 
@@ -85,6 +394,9 @@ def dashboard_page(model_data: dict, snapshots: list | None = None):
             html.Code(f"Output: {output_desc}"),
         ]), className="mb-3"),
     ]
+
+    # ── 2b. Live analysis sections (FLOPs, activations, pruning) ────
+    children.extend(_build_live_analysis_sections(live, model_data))
 
     # ── 3. Architecture graph (health-colored when snapshots, plain otherwise)
     if snapshots:
@@ -244,6 +556,31 @@ def dashboard_page(model_data: dict, snapshots: list | None = None):
             dcc.Graph(figure=norm_fig),
         ]), className="mb-3"))
 
+        # ── 4b. Norm Evolution Across Checkpoints ────────────────────
+        if len(snapshots) >= 2:
+            ckpt_names_norm = [s["name"] for s in snapshots]
+            # Build norm table: layers x checkpoints
+            weight_layer_names = [s["layer"] for s in weight_layers]
+            norm_table: list[list[float | None]] = []
+            for layer in weight_layer_names:
+                row: list[float | None] = []
+                for sn in snapshots:
+                    stat = next((s for s in sn["weight_stats"] if s["layer"] == layer), None)
+                    row.append(stat.get("norm_l2") if stat else None)
+                norm_table.append(row)
+
+            n_means, n_mins, n_maxs = _column_summary(norm_table, len(ckpt_names_norm))
+            norm_evo_fig = _summary_chart(
+                ckpt_names_norm, n_means, n_mins, n_maxs,
+                "L2 Norm Evolution", "L2 Norm",
+            )
+            children.append(dbc.Card(dbc.CardBody([
+                html.H5("Norm Evolution Across Checkpoints", className="card-title"),
+                html.P("Mean, min, and max L2 norm across all weight layers per checkpoint.",
+                        className="text-muted"),
+                dcc.Graph(figure=norm_evo_fig),
+            ]), className="mb-3"))
+
         # ── 5. Layer Histogram Comparison ────────────────────────────
         children.append(dbc.Card(dbc.CardBody([
             html.H5("Layer Histogram Comparison", className="card-title"),
@@ -305,6 +642,20 @@ def dashboard_page(model_data: dict, snapshots: list | None = None):
                     ),
                 ),
             ]), className="mb-3"))
+
+            # ── 6b. Effective Rank Chart ─────────────────────────────
+            if len(checkpoint_names) >= 2:
+                r_means, r_mins, r_maxs = _column_summary(svd_rank_table, len(checkpoint_names))
+                rank_chart = _summary_chart(
+                    checkpoint_names, r_means, r_mins, r_maxs,
+                    "Effective Rank Summary", "Effective Rank",
+                )
+                children.append(dbc.Card(dbc.CardBody([
+                    html.H5("Effective Rank Trend", className="card-title"),
+                    html.P("Aggregate effective rank across all 2D weight layers per checkpoint.",
+                            className="text-muted"),
+                    dcc.Graph(figure=rank_chart),
+                ]), className="mb-3"))
 
             # ── 7. Singular Value Spectrum ────────────────────────────
             children.append(dbc.Card(dbc.CardBody([
@@ -457,6 +808,222 @@ def dashboard_page(model_data: dict, snapshots: list | None = None):
                     ),
                 ),
             ]), className="mb-3"))
+
+        # ── 10.1 Kurtosis & Sparsity Evolution Charts ──────────────
+        evo_metrics = {
+            "kurtosis": {"label": "Kurtosis", "color": "#e74c3c"},
+            "near_zero_pct": {"label": "Near-Zero %", "color": "#9b59b6"},
+            "condition_number": {"label": "Condition Number", "color": "#1abc9c"},
+        }
+        evo_ckpt_names, evo_layers, evo_tables = compute_scalar_metric_tables(
+            snapshots, list(evo_metrics.keys()), max_layers=100,
+        )
+        if evo_layers and evo_tables and len(evo_ckpt_names) >= 2:
+            evo_fig = go.Figure()
+            for mkey, meta in evo_metrics.items():
+                if mkey not in evo_tables:
+                    continue
+                m_means, _, _ = _column_summary(evo_tables[mkey], len(evo_ckpt_names))
+                if mkey == "condition_number":
+                    # Log scale for condition numbers
+                    import math
+                    m_means = [math.log10(v) if v and v > 0 else None for v in m_means]
+                    label = "log10(Condition)"
+                else:
+                    label = meta["label"]
+                evo_fig.add_trace(go.Scatter(
+                    x=evo_ckpt_names, y=m_means, mode="lines+markers",
+                    name=label, line={"color": meta["color"]},
+                ))
+            evo_fig.update_layout(
+                **plotly_layout(title="Distribution Metric Evolution"),
+                height=340, xaxis_title="Checkpoint", yaxis_title="Mean Value",
+            )
+            children.append(dbc.Card(dbc.CardBody([
+                html.H5("Distribution Metric Evolution", className="card-title"),
+                html.P(
+                    "Mean kurtosis, near-zero weight fraction, and condition number "
+                    "across all layers per checkpoint.",
+                    className="text-muted",
+                ),
+                dcc.Graph(figure=evo_fig),
+            ]), className="mb-3"))
+
+        # ── 10a. WeightWatcher Metrics (curated) ───────────────────
+        ww_metric_meta = {
+            "alpha": {"label": "Alpha", "fmt": lambda v: f"{v:.3f}"},
+            "alpha_weighted": {"label": "Alpha Weighted", "fmt": lambda v: f"{v:.3f}"},
+            "mp_softrank": {"label": "MP Softrank", "fmt": lambda v: f"{v:.3f}"},
+            "num_spikes": {"label": "Spikes", "fmt": lambda v: f"{v:.0f}"},
+            "log_spectral_norm": {"label": "log10(lambda_max)", "fmt": lambda v: f"{v:.3f}"},
+            "lambda_plus": {"label": "MP Edge (lambda+)", "fmt": lambda v: f"{v:.3g}"},
+        }
+        ww_checkpoint_names, ww_layers, ww_tables = compute_scalar_metric_tables(
+            snapshots,
+            list(ww_metric_meta.keys()),
+            max_layers=50,
+        )
+
+        if ww_layers and ww_tables:
+            ww_options = [
+                {"label": ww_metric_meta[key]["label"], "value": key}
+                for key in ww_metric_meta
+                if key in ww_tables
+            ]
+            default_ww_metric = ww_options[0]["value"]
+            ww_slider_marks = {i: str(i + 1) for i in range(len(ww_checkpoint_names))}
+            children.append(dbc.Card(dbc.CardBody([
+                html.H5("WeightWatcher Metrics", className="card-title"),
+                html.P(
+                    "Checkpoint spectral quality metrics. Default view is curated; "
+                    "raw ESD remains in the detailed spectral section below.",
+                    className="text-muted",
+                ),
+                dbc.Row([
+                    dbc.Col(dcc.Dropdown(
+                        id="ww-metric-select",
+                        options=ww_options,
+                        value=default_ww_metric,
+                        clearable=False,
+                    ), md=5),
+                    dbc.Col(dbc.RadioItems(
+                        id="ww-metric-mode",
+                        options=[
+                            {"label": "Full table", "value": "full"},
+                            {"label": "Single checkpoint", "value": "single"},
+                        ],
+                        value="full",
+                        inline=True,
+                    ), md=7),
+                ], className="g-2 mb-2"),
+                html.Div([
+                    dcc.Slider(
+                        id="ww-metric-slider",
+                        min=0,
+                        max=len(ww_checkpoint_names) - 1,
+                        step=1,
+                        value=0,
+                        marks=ww_slider_marks,
+                        tooltip={"placement": "bottom", "always_visible": False},
+                    ),
+                    html.Div(
+                        [
+                            html.Span("Selected checkpoint: ", className="text-muted"),
+                            html.Span(ww_checkpoint_names[0], id="ww-metric-slider-label", className="fw-semibold"),
+                        ],
+                        className="mt-2 small",
+                    ),
+                ], id="ww-metric-slider-wrap", style={"display": "none"}, className="mb-2"),
+                html.Div(
+                    id="ww-metric-table-wrap",
+                    children=render_checkpoint_change_table(
+                        checkpoint_names=ww_checkpoint_names,
+                        all_layers=ww_layers,
+                        values_table=ww_tables[default_ww_metric],
+                        mode="full",
+                        selected_idx=0,
+                        formatter=ww_metric_meta[default_ww_metric]["fmt"],
+                    ),
+                ),
+            ]), className="mb-3"))
+
+        # ── 10c. Directional Drift Metrics ──────────────────────────
+        drift_metric_meta = {
+            "drift_cosine_prev": {"label": "Cosine vs Prev", "fmt": lambda v: f"{v:.4f}"},
+            "drift_subspace_overlap_prev": {"label": "Subspace Overlap vs Prev", "fmt": lambda v: f"{v:.4f}"},
+            "drift_cka_prev": {"label": "CKA vs Prev", "fmt": lambda v: f"{v:.4f}"},
+        }
+        drift_checkpoint_names, drift_layers, drift_tables = compute_scalar_metric_tables(
+            snapshots,
+            list(drift_metric_meta.keys()),
+            max_layers=50,
+        )
+        if drift_layers and drift_tables:
+            drift_options = [
+                {"label": drift_metric_meta[key]["label"], "value": key}
+                for key in drift_metric_meta
+                if key in drift_tables
+            ]
+            default_drift_metric = drift_options[0]["value"]
+            drift_slider_marks = {i: str(i + 1) for i in range(len(drift_checkpoint_names))}
+            children.append(dbc.Card(dbc.CardBody([
+                html.H5("Directional Drift", className="card-title"),
+                html.P(
+                    "Checkpoint-to-checkpoint alignment metrics for each layer.",
+                    className="text-muted",
+                ),
+                dbc.Row([
+                    dbc.Col(dcc.Dropdown(
+                        id="drift-metric-select",
+                        options=drift_options,
+                        value=default_drift_metric,
+                        clearable=False,
+                    ), md=5),
+                    dbc.Col(dbc.RadioItems(
+                        id="drift-metric-mode",
+                        options=[
+                            {"label": "Full table", "value": "full"},
+                            {"label": "Single checkpoint", "value": "single"},
+                        ],
+                        value="full",
+                        inline=True,
+                    ), md=7),
+                ], className="g-2 mb-2"),
+                html.Div([
+                    dcc.Slider(
+                        id="drift-metric-slider",
+                        min=0,
+                        max=len(drift_checkpoint_names) - 1,
+                        step=1,
+                        value=0,
+                        marks=drift_slider_marks,
+                        tooltip={"placement": "bottom", "always_visible": False},
+                    ),
+                    html.Div(
+                        [
+                            html.Span("Selected checkpoint: ", className="text-muted"),
+                            html.Span(
+                                drift_checkpoint_names[0],
+                                id="drift-metric-slider-label",
+                                className="fw-semibold",
+                            ),
+                        ],
+                        className="mt-2 small",
+                    ),
+                ], id="drift-metric-slider-wrap", style={"display": "none"}, className="mb-2"),
+                html.Div(
+                    id="drift-metric-table-wrap",
+                    children=render_checkpoint_change_table(
+                        checkpoint_names=drift_checkpoint_names,
+                        all_layers=drift_layers,
+                        values_table=drift_tables[default_drift_metric],
+                        mode="full",
+                        selected_idx=0,
+                        formatter=drift_metric_meta[default_drift_metric]["fmt"],
+                    ),
+                ),
+            ]), className="mb-3"))
+
+            # ── 10d. Drift Summary Chart ────────────────────────────
+            if len(drift_checkpoint_names) >= 2:
+                drift_chart = go.Figure()
+                drift_colors = {"drift_cosine_prev": "#375a7f", "drift_subspace_overlap_prev": "#e67e22", "drift_cka_prev": "#00bc8c"}
+                for dkey, dtable in drift_tables.items():
+                    d_means, _, _ = _column_summary(dtable, len(drift_checkpoint_names))
+                    drift_chart.add_trace(go.Scatter(
+                        x=drift_checkpoint_names, y=d_means, mode="lines+markers",
+                        name=drift_metric_meta[dkey]["label"],
+                        line={"color": drift_colors.get(dkey, "#375a7f")},
+                    ))
+                drift_chart.update_layout(
+                    **plotly_layout(title="Directional Drift Summary"),
+                    height=340, xaxis_title="Checkpoint", yaxis_title="Mean Alignment",
+                )
+                children.append(dbc.Card(dbc.CardBody([
+                    html.H5("Drift Summary Chart", className="card-title"),
+                    html.P("Mean alignment across all layers per checkpoint.", className="text-muted"),
+                    dcc.Graph(figure=drift_chart),
+                ]), className="mb-3"))
 
         # ── 10b. Spectral Analysis (ESD) ────────────────────────────
         esd_layers = [

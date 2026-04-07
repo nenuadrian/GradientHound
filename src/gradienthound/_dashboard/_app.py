@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import dash_bootstrap_components as dbc
@@ -15,13 +16,171 @@ from ._helpers import (
     plotly_layout, short_layer, placeholder_page, node_detail_panel,
     compute_checkpoint_change_tables, render_checkpoint_change_table,
     compute_effective_rank_table, compute_distribution_stats_table,
+    compute_scalar_metric_tables,
 )
 from ._health import weight_health
 from ._wandb import parse_wandb_project_run_id, fetch_wandb_run_metrics, metrics_page_wandb
 from ._pages import (
     dashboard_page, gradient_flow_page, landing_page_empty,
-    checkpoints_page, checkpoints_page_empty,
+    checkpoints_page, checkpoints_page_empty, weightwatcher_page,
+    live_page, on_demand_page, raw_data_page,
 )
+
+
+def _merge_model_exports(gh_files: list[Path]) -> dict:
+    """Merge multiple ``.gh.json`` model exports into a single descriptor.
+
+    Each file's module tree, parameters, and FX graph are prefixed with the
+    model name so they coexist without collisions.  This lets GradientHound
+    display multi-network architectures (e.g. actor + critic) as one view.
+    """
+    merged: dict = {
+        "format_version": "1.0",
+        "model_name": "",
+        "model_class": "",
+        "total_params": 0,
+        "trainable_params": 0,
+        "inputs": [],
+        "outputs": [],
+        "module_tree": {"name": "root", "modules": []},
+        "parameters": {},
+    }
+
+    names: list[str] = []
+    for gh_file in gh_files:
+        with open(gh_file) as f:
+            data = json.load(f)
+
+        name = data.get("model_name", gh_file.stem)
+        names.append(name)
+        prefix = name
+
+        merged["total_params"] += data.get("total_params", 0)
+        merged["trainable_params"] += data.get("trainable_params", 0)
+
+        # Merge inputs/outputs with prefix
+        for inp in data.get("inputs", []):
+            inp_copy = dict(inp)
+            inp_copy["name"] = f"{prefix}/{inp_copy.get('name', '')}"
+            merged["inputs"].append(inp_copy)
+        for out in data.get("outputs", []):
+            out_copy = dict(out)
+            out_copy["name"] = f"{prefix}/{out_copy.get('name', '')}"
+            merged["outputs"].append(out_copy)
+
+        # Merge parameters with prefix
+        for param_name, param_info in data.get("parameters", {}).items():
+            merged["parameters"][f"{prefix}.{param_name}"] = param_info
+
+        # Merge module tree: prefix all paths
+        mt = data.get("module_tree", {})
+        for mod in mt.get("modules", []):
+            mod_copy = dict(mod)
+            mod_copy["path"] = f"{prefix}.{mod_copy['path']}" if mod_copy.get("path") else prefix
+            if "children" in mod_copy:
+                mod_copy["children"] = [f"{prefix}.{c}" for c in mod_copy["children"]]
+            merged["module_tree"]["modules"].append(mod_copy)
+
+        # Add a synthetic parent node for this sub-model
+        top_children = [
+            f"{prefix}.{m['path']}" for m in mt.get("modules", [])
+            if m.get("path") and "." not in m["path"]
+        ]
+        # If the module tree has a root, just prefix it; otherwise create one
+        root_modules = [m for m in mt.get("modules", []) if m.get("path") == mt.get("name", "")]
+        if not root_modules:
+            merged["module_tree"]["modules"].append({
+                "path": prefix,
+                "type": data.get("model_name", name),
+                "type_full": data.get("model_class", ""),
+                "is_leaf": False,
+                "children": top_children,
+                "params": data.get("total_params", 0),
+            })
+
+        # Merge FX graph with prefixed node names
+        fx = data.get("fx_graph")
+        if fx:
+            if "fx_graph" not in merged:
+                merged["fx_graph"] = {"nodes": [], "edges": []}
+            for node in fx.get("nodes", []):
+                node_copy = dict(node)
+                node_copy["name"] = f"{prefix}__{node_copy['name']}"
+                if node_copy.get("nn_module"):
+                    node_copy["nn_module"] = f"{prefix}.{node_copy['nn_module']}"
+                node_copy["args"] = [f"{prefix}__{a}" for a in node_copy.get("args", [])]
+                merged["fx_graph"]["nodes"].append(node_copy)
+            for edge in fx.get("edges", []):
+                merged["fx_graph"]["edges"].append({
+                    "from": f"{prefix}__{edge['from']}",
+                    "to": f"{prefix}__{edge['to']}",
+                })
+
+        # Merge graph signature
+        sig = data.get("graph_signature")
+        if sig:
+            if "graph_signature" not in merged:
+                merged["graph_signature"] = {
+                    "parameters": [], "buffers": [],
+                    "user_inputs": [], "user_outputs": [],
+                }
+            ms = merged["graph_signature"]
+            ms["parameters"].extend(f"{prefix}.{p}" for p in sig.get("parameters", []))
+            ms["buffers"].extend(f"{prefix}.{b}" for b in sig.get("buffers", []))
+            ms["user_inputs"].extend(f"{prefix}__{i}" for i in sig.get("user_inputs", []))
+            ms["user_outputs"].extend(f"{prefix}__{o}" for o in sig.get("user_outputs", []))
+
+        # Merge live analysis (FLOPs, activations, pruning groups)
+        sub_live = data.get("live_analysis")
+        if sub_live:
+            if "live_analysis" not in merged:
+                merged["live_analysis"] = {
+                    "flops": {"total_flops": 0, "by_module": {}, "by_operator": {}, "unsupported_ops": {}},
+                    "activations": {},
+                    "pruning_groups": [],
+                }
+            ml = merged["live_analysis"]
+
+            sub_flops = sub_live.get("flops")
+            if sub_flops:
+                ml["flops"]["total_flops"] += sub_flops.get("total_flops", 0)
+                for mod, count in sub_flops.get("by_module", {}).items():
+                    ml["flops"]["by_module"][f"{prefix}.{mod}"] = count
+                for op, count in sub_flops.get("by_operator", {}).items():
+                    ml["flops"]["by_operator"][op] = ml["flops"]["by_operator"].get(op, 0) + count
+                for op, count in sub_flops.get("unsupported_ops", {}).items():
+                    ml["flops"]["unsupported_ops"][op] = ml["flops"]["unsupported_ops"].get(op, 0) + count
+
+            sub_acts = sub_live.get("activations")
+            if sub_acts:
+                for mod, info in sub_acts.items():
+                    ml["activations"][f"{prefix}.{mod}"] = info
+
+            sub_pruning = sub_live.get("pruning_groups")
+            if sub_pruning:
+                for group in sub_pruning:
+                    prefixed = dict(group)
+                    prefixed["coupled_layers"] = [
+                        f"{prefix}/{l}" for l in group.get("coupled_layers", [])
+                    ]
+                    prefixed["sub_model"] = prefix
+                    ml["pruning_groups"].append(prefixed)
+
+    merged["model_name"] = " + ".join(names)
+    merged["model_class"] = ", ".join(names)
+    merged["sub_models"] = names
+
+    # Add root node with children pointing to each sub-model
+    merged["module_tree"]["modules"].insert(0, {
+        "path": "root",
+        "type": merged["model_name"],
+        "type_full": "",
+        "is_leaf": False,
+        "children": names,
+        "params": merged["total_params"],
+    })
+
+    return merged
 
 
 def create_app(
@@ -39,18 +198,21 @@ def create_app(
         external_stylesheets=[dbc.themes.FLATLY],
     )
 
-    # Load model export
+    # Load model export(s)
     model_data: dict | None = None
     if model_path:
         p = Path(model_path)
+        gh_files: list[Path] = []
         if p.is_dir():
             gh_files = sorted(p.glob("*.gh.json"))
-            if gh_files:
-                with open(gh_files[0]) as f:
-                    model_data = json.load(f)
         elif p.exists():
-            with open(p) as f:
+            gh_files = [p]
+
+        if len(gh_files) == 1:
+            with open(gh_files[0]) as f:
                 model_data = json.load(f)
+        elif len(gh_files) > 1:
+            model_data = _merge_model_exports(gh_files)
 
     # IPC channel
     ipc = None
@@ -95,11 +257,29 @@ def create_app(
         className="mb-3 shadow-sm border-bottom",
     )
 
+    # Background task state -- shared across callbacks, mutated by threads
+    bg_tasks: dict = {
+        "ckpt_running": False,
+        "ckpt_done": False,
+        "ckpt_error": None,
+        "ckpt_message": None,
+        "wandb_running": False,
+        "wandb_done": False,
+        "wandb_error": None,
+        "wandb_data": None,
+        "wandb_message": None,
+    }
+
     app.layout = html.Div([
         dcc.Location(id="url", refresh=False),
         dcc.Store(id="ckpt-store", data=None),
         dcc.Store(id="wandb-store", data=None),
+        # Polling intervals for background tasks (disabled until a task starts)
+        dcc.Interval(id="ckpt-poll", interval=1000, n_intervals=0, disabled=True),
+        dcc.Interval(id="wandb-poll", interval=1000, n_intervals=0, disabled=True),
         navbar,
+        # Global background-task status bar (visible from any page)
+        html.Div(id="bg-task-bar", className="px-4"),
         dbc.Container(html.Div(id="gh-content"), fluid=True, className="px-4"),
     ])
 
@@ -136,19 +316,31 @@ def create_app(
             return not is_open
         return is_open
 
-    # ── Process checkpoints ──────────────────────────────────────────
+    # ── Global background-task status bar ─────────────────────────
+
+    @callback(
+        Output("bg-task-bar", "children"),
+        Input("ckpt-poll", "n_intervals"),
+        Input("wandb-poll", "n_intervals"),
+    )
+    def _update_bg_task_bar(_ckpt_n, _wandb_n):
+        items = []
+        if bg_tasks["ckpt_running"]:
+            items.append(dbc.Alert([
+                dbc.Spinner(size="sm", spinner_class_name="me-2"),
+                "Processing checkpoints\u2026",
+            ], color="info", className="mb-1 py-2", dismissable=False))
+        if bg_tasks["wandb_running"]:
+            items.append(dbc.Alert([
+                dbc.Spinner(size="sm", spinner_class_name="me-2"),
+                "Fetching W&B metrics\u2026",
+            ], color="info", className="mb-1 py-2", dismissable=False))
+        return items if items else ""
+
+    # ── Process checkpoints (background) ───────────────────────────
 
     if has_checkpoints:
-        @callback(
-            Output("ckpt-store", "data"),
-            Output("ckpt-status", "children"),
-            Output("ckpt-process-btn", "disabled"),
-            Input("ckpt-process-btn", "n_clicks"),
-            prevent_initial_call=True,
-        )
-        def _process_ckpts(n_clicks):
-            if not n_clicks:
-                return no_update, no_update, no_update
+        def _ckpt_worker():
             from gradienthound.checkpoint import process_checkpoints
             try:
                 snapshots = process_checkpoints(
@@ -157,34 +349,65 @@ def create_app(
                 ckpt_state["snapshots"] = snapshots
                 ckpt_state["processed"] = True
                 n_params = len({s["layer"] for snap in snapshots for s in snap["weight_stats"]})
-                return {"ready": True}, f"Done \u2014 {len(snapshots)} checkpoints, {n_params} params", True
+                bg_tasks["ckpt_message"] = f"Done \u2014 {len(snapshots)} checkpoints, {n_params} params"
+                bg_tasks["ckpt_done"] = True
             except Exception as exc:
-                return no_update, f"Error: {exc}", False
+                bg_tasks["ckpt_error"] = str(exc)
+                bg_tasks["ckpt_done"] = True
+            finally:
+                bg_tasks["ckpt_running"] = False
 
-    # ── Fetch W&B run metrics ───────────────────────────────────────
-
-    @callback(
-        Output("wandb-store", "data"),
-        Output("wandb-fetch-status", "children"),
-        Input("wandb-fetch-btn", "n_clicks"),
-        State("wandb-entity-input", "value"),
-        State("wandb-project-run-id-input", "value"),
-        prevent_initial_call=True,
-    )
-    def _fetch_wandb_metrics(n_clicks, entity_value, project_run_id_value):
-        if not n_clicks:
-            return no_update, no_update
-
-        entity = (entity_value or "").strip()
-        project_run_id_str = (project_run_id_value or "").strip()
-
-        if not entity or not project_run_id_str:
-            return no_update, dbc.Alert(
-                "Both Entity and Project/Run ID are required.",
-                color="warning",
-                className="mb-0",
+        @callback(
+            Output("ckpt-status", "children", allow_duplicate=True),
+            Output("ckpt-process-btn", "disabled", allow_duplicate=True),
+            Output("ckpt-poll", "disabled"),
+            Input("ckpt-process-btn", "n_clicks"),
+            prevent_initial_call=True,
+        )
+        def _start_ckpt_processing(n_clicks):
+            if not n_clicks or bg_tasks["ckpt_running"]:
+                return no_update, no_update, no_update
+            bg_tasks["ckpt_running"] = True
+            bg_tasks["ckpt_done"] = False
+            bg_tasks["ckpt_error"] = None
+            bg_tasks["ckpt_message"] = None
+            threading.Thread(target=_ckpt_worker, daemon=True).start()
+            return (
+                [dbc.Spinner(size="sm", spinner_class_name="me-2"),
+                 "Processing checkpoints in background\u2026 you can navigate other pages."],
+                True,
+                False,  # enable polling
             )
 
+        @callback(
+            Output("ckpt-store", "data"),
+            Output("ckpt-status", "children"),
+            Output("ckpt-process-btn", "disabled"),
+            Output("ckpt-poll", "disabled", allow_duplicate=True),
+            Input("ckpt-poll", "n_intervals"),
+            prevent_initial_call=True,
+        )
+        def _poll_ckpt_processing(_n):
+            if not bg_tasks["ckpt_done"]:
+                return no_update, no_update, no_update, no_update
+            # Task finished
+            if bg_tasks["ckpt_error"]:
+                return (
+                    no_update,
+                    dbc.Alert(f"Error: {bg_tasks['ckpt_error']}", color="danger", className="mb-0"),
+                    False,
+                    True,  # disable polling
+                )
+            return (
+                {"ready": True},
+                dbc.Alert(bg_tasks["ckpt_message"], color="success", className="mb-0"),
+                True,
+                True,  # disable polling
+            )
+
+    # ── Fetch W&B run metrics (background) ────────────────────────
+
+    def _wandb_worker(entity: str, project_run_id_str: str):
         try:
             project, run_id = parse_wandb_project_run_id(project_run_id_str)
             entries, run_label = fetch_wandb_run_metrics(entity, project, run_id)
@@ -201,18 +424,75 @@ def create_app(
             wandb_state["entity"] = entity
             wandb_state["project_run_id"] = project_run_id_str
             wandb_state["data"] = data
-
-            return data, dbc.Alert(
-                f"Fetched {len(metric_keys)} metrics across {len(entries)} points.",
-                color="success",
-                className="mb-0",
-            )
+            bg_tasks["wandb_data"] = data
+            bg_tasks["wandb_message"] = f"Fetched {len(metric_keys)} metrics across {len(entries)} points."
+            bg_tasks["wandb_done"] = True
         except Exception as exc:
-            return no_update, dbc.Alert(
-                f"Failed to fetch W&B metrics: {exc}",
-                color="danger",
-                className="mb-0",
+            bg_tasks["wandb_error"] = str(exc)
+            bg_tasks["wandb_done"] = True
+        finally:
+            bg_tasks["wandb_running"] = False
+
+    @callback(
+        Output("wandb-fetch-status", "children", allow_duplicate=True),
+        Output("wandb-fetch-btn", "disabled"),
+        Output("wandb-poll", "disabled"),
+        Input("wandb-fetch-btn", "n_clicks"),
+        State("wandb-entity-input", "value"),
+        State("wandb-project-run-id-input", "value"),
+        prevent_initial_call=True,
+    )
+    def _start_wandb_fetch(n_clicks, entity_value, project_run_id_value):
+        if not n_clicks or bg_tasks["wandb_running"]:
+            return no_update, no_update, no_update
+
+        entity = (entity_value or "").strip()
+        project_run_id_str = (project_run_id_value or "").strip()
+
+        if not entity or not project_run_id_str:
+            return (
+                dbc.Alert("Both Entity and Project/Run ID are required.", color="warning", className="mb-0"),
+                no_update,
+                no_update,
             )
+
+        bg_tasks["wandb_running"] = True
+        bg_tasks["wandb_done"] = False
+        bg_tasks["wandb_error"] = None
+        bg_tasks["wandb_data"] = None
+        bg_tasks["wandb_message"] = None
+        threading.Thread(target=_wandb_worker, args=(entity, project_run_id_str), daemon=True).start()
+        return (
+            [dbc.Spinner(size="sm", spinner_class_name="me-2"),
+             "Fetching W&B metrics in background\u2026 you can navigate other pages."],
+            True,
+            False,  # enable polling
+        )
+
+    @callback(
+        Output("wandb-store", "data"),
+        Output("wandb-fetch-status", "children"),
+        Output("wandb-fetch-btn", "disabled", allow_duplicate=True),
+        Output("wandb-poll", "disabled", allow_duplicate=True),
+        Input("wandb-poll", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def _poll_wandb_fetch(_n):
+        if not bg_tasks["wandb_done"]:
+            return no_update, no_update, no_update, no_update
+        if bg_tasks["wandb_error"]:
+            return (
+                no_update,
+                dbc.Alert(f"Failed to fetch W&B metrics: {bg_tasks['wandb_error']}", color="danger", className="mb-0"),
+                False,
+                True,  # disable polling
+            )
+        return (
+            bg_tasks["wandb_data"],
+            dbc.Alert(bg_tasks["wandb_message"], color="success", className="mb-0"),
+            False,
+            True,  # disable polling
+        )
 
     # ── Routing ──────────────────────────────────────────────────────
 
@@ -248,6 +528,22 @@ def create_app(
             if has_checkpoints:
                 return checkpoints_page(ckpt_state["paths"], snapshots)
             return checkpoints_page_empty()
+
+        if pathname == "/weightwatcher":
+            return weightwatcher_page(snapshots)
+
+        if pathname == "/live":
+            return live_page(has_ipc=ipc is not None)
+
+        if pathname == "/on-demand":
+            model_names = sorted(ipc.read_models().keys()) if ipc else []
+            return on_demand_page(model_names=model_names, has_ipc=ipc is not None)
+
+        if pathname == "/raw-data":
+            return raw_data_page(
+                has_ipc=ipc is not None,
+                data_dir=str(ipc.directory) if ipc else None,
+            )
 
         if pathname in PAGES:
             title, desc = PAGES[pathname]
@@ -637,6 +933,93 @@ def create_app(
         slider_style = {"display": "block" if mode == "single" else "none"}
         return table, slider_style, checkpoint_names[idx]
 
+    @callback(
+        Output("ww-metric-table-wrap", "children"),
+        Output("ww-metric-slider-wrap", "style"),
+        Output("ww-metric-slider-label", "children"),
+        Input("ww-metric-select", "value"),
+        Input("ww-metric-mode", "value"),
+        Input("ww-metric-slider", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_weightwatcher_metrics_table(metric_key, mode, slider_idx):
+        snapshots = ckpt_state.get("snapshots", [])
+        if not snapshots:
+            return no_update, no_update, no_update
+
+        metric_meta = {
+            "alpha": lambda v: f"{v:.3f}",
+            "alpha_weighted": lambda v: f"{v:.3f}",
+            "mp_softrank": lambda v: f"{v:.3f}",
+            "num_spikes": lambda v: f"{v:.0f}",
+            "log_spectral_norm": lambda v: f"{v:.3f}",
+            "lambda_plus": lambda v: f"{v:.3g}",
+        }
+        checkpoint_names, layers, tables = compute_scalar_metric_tables(
+            snapshots,
+            list(metric_meta.keys()),
+            max_layers=50,
+        )
+        if not checkpoint_names or not layers or not tables:
+            return no_update, no_update, no_update
+
+        key = metric_key if metric_key in tables else next(iter(tables))
+        idx = int(slider_idx or 0)
+        idx = max(0, min(idx, len(checkpoint_names) - 1))
+
+        table = render_checkpoint_change_table(
+            checkpoint_names=checkpoint_names,
+            all_layers=layers,
+            values_table=tables[key],
+            mode=mode or "full",
+            selected_idx=idx,
+            formatter=metric_meta.get(key, lambda v: f"{v:.4g}"),
+        )
+        slider_style = {"display": "block" if mode == "single" else "none"}
+        return table, slider_style, checkpoint_names[idx]
+
+    @callback(
+        Output("drift-metric-table-wrap", "children"),
+        Output("drift-metric-slider-wrap", "style"),
+        Output("drift-metric-slider-label", "children"),
+        Input("drift-metric-select", "value"),
+        Input("drift-metric-mode", "value"),
+        Input("drift-metric-slider", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_drift_metrics_table(metric_key, mode, slider_idx):
+        snapshots = ckpt_state.get("snapshots", [])
+        if not snapshots:
+            return no_update, no_update, no_update
+
+        metric_meta = {
+            "drift_cosine_prev": lambda v: f"{v:.4f}",
+            "drift_subspace_overlap_prev": lambda v: f"{v:.4f}",
+            "drift_cka_prev": lambda v: f"{v:.4f}",
+        }
+        checkpoint_names, layers, tables = compute_scalar_metric_tables(
+            snapshots,
+            list(metric_meta.keys()),
+            max_layers=50,
+        )
+        if not checkpoint_names or not layers or not tables:
+            return no_update, no_update, no_update
+
+        key = metric_key if metric_key in tables else next(iter(tables))
+        idx = int(slider_idx or 0)
+        idx = max(0, min(idx, len(checkpoint_names) - 1))
+
+        table = render_checkpoint_change_table(
+            checkpoint_names=checkpoint_names,
+            all_layers=layers,
+            values_table=tables[key],
+            mode=mode or "full",
+            selected_idx=idx,
+            formatter=metric_meta.get(key, lambda v: f"{v:.4g}"),
+        )
+        slider_style = {"display": "block" if mode == "single" else "none"}
+        return table, slider_style, checkpoint_names[idx]
+
     # ── Network state: health node click ────────────────────────────
 
     @callback(
@@ -725,5 +1108,985 @@ def create_app(
             html.H5(f"Details: {mod_path}", className="mt-3 mb-2"),
             *cards,
         ])
+
+    @callback(
+        Output("ww-metric-heatmap", "figure"),
+        Output("ww-metric-trend", "figure"),
+        Input("ww-global-metric-select", "value", allow_optional=True),
+        Input("ww-checkpoint-select", "value", allow_optional=True),
+    )
+    def _update_ww_metric_views(metric_key, selected_checkpoint):
+        import plotly.graph_objects as go
+
+        snapshots = ckpt_state.get("snapshots", [])
+        empty = go.Figure()
+        if not snapshots:
+            return empty, empty
+
+        metric_labels = {
+            "alpha": "Alpha",
+            "alpha_weighted": "Alpha Weighted",
+            "mp_softrank": "MP Softrank",
+            "num_spikes": "Spikes",
+            "log_spectral_norm": "log10(lambda_max)",
+            "lambda_plus": "MP edge (lambda+)",
+        }
+        metric_keys = list(metric_labels.keys())
+        checkpoint_names, layers, tables = compute_scalar_metric_tables(
+            snapshots,
+            metric_keys,
+            max_layers=200,
+        )
+        if not checkpoint_names or not layers or not tables:
+            return empty, empty
+
+        key = metric_key if metric_key in tables else next(iter(tables))
+        table = tables[key]
+        label = metric_labels.get(key, key)
+        selected_name = selected_checkpoint if selected_checkpoint in checkpoint_names else checkpoint_names[-1]
+        selected_idx = checkpoint_names.index(selected_name)
+
+        heatmap = go.Figure(go.Heatmap(
+            z=table,
+            x=checkpoint_names,
+            y=[short_layer(layer) for layer in layers],
+            colorscale="Viridis",
+            colorbar={"title": label},
+            hovertemplate="layer=%{y}<br>checkpoint=%{x}<br>value=%{z:.4g}<extra></extra>",
+        ))
+        heatmap.update_layout(
+            **plotly_layout(title=f"{label} Heatmap"),
+            height=520,
+            yaxis={"autorange": "reversed"},
+        )
+        heatmap.add_vline(
+            x=selected_name,
+            line_width=2,
+            line_dash="dash",
+            line_color="#dc3545",
+        )
+
+        means: list[float | None] = []
+        mins: list[float | None] = []
+        maxs: list[float | None] = []
+        for ci in range(len(checkpoint_names)):
+            col_vals = [row[ci] for row in table if row[ci] is not None]
+            if col_vals:
+                means.append(sum(col_vals) / len(col_vals))
+                mins.append(min(col_vals))
+                maxs.append(max(col_vals))
+            else:
+                means.append(None)
+                mins.append(None)
+                maxs.append(None)
+
+        trend = go.Figure()
+        trend.add_trace(go.Scatter(
+            x=checkpoint_names,
+            y=means,
+            mode="lines+markers",
+            name="mean",
+            line={"color": "#375a7f", "width": 3},
+        ))
+        trend.add_trace(go.Scatter(
+            x=checkpoint_names,
+            y=maxs,
+            mode="lines",
+            name="max",
+            line={"color": "#e67e22", "dash": "dot"},
+        ))
+        trend.add_trace(go.Scatter(
+            x=checkpoint_names,
+            y=mins,
+            mode="lines",
+            name="min",
+            line={"color": "#00bc8c", "dash": "dot"},
+        ))
+        selected_y = means[selected_idx] if selected_idx < len(means) else None
+        if selected_y is not None:
+            trend.add_trace(go.Scatter(
+                x=[selected_name],
+                y=[selected_y],
+                mode="markers",
+                name="selected",
+                marker={"size": 12, "color": "#dc3545", "symbol": "diamond"},
+            ))
+        trend.update_layout(
+            **plotly_layout(title=f"{label} Summary Across Checkpoints"),
+            height=340,
+            xaxis_title="Checkpoint",
+            yaxis_title=label,
+        )
+
+        return heatmap, trend
+
+    @callback(
+        Output("ww-layer-multi-metric", "figure"),
+        Output("ww-layer-esd", "figure"),
+        Input("ww-layer-select", "value", allow_optional=True),
+        Input("ww-checkpoint-select", "value", allow_optional=True),
+    )
+    def _update_ww_layer_views(selected_layer, selected_checkpoint):
+        import plotly.graph_objects as go
+
+        snapshots = ckpt_state.get("snapshots", [])
+        multi = go.Figure()
+        esd_fig = go.Figure()
+        if not snapshots or not selected_layer:
+            return multi, esd_fig
+
+        checkpoint_names = [snap.get("name", "?") for snap in snapshots]
+        selected_name = selected_checkpoint if selected_checkpoint in checkpoint_names else checkpoint_names[-1]
+        metric_meta = {
+            "alpha": {"name": "Alpha", "color": "#375a7f"},
+            "alpha_weighted": {"name": "Alpha Weighted", "color": "#00bc8c"},
+            "mp_softrank": {"name": "MP Softrank", "color": "#e67e22"},
+            "num_spikes": {"name": "Spikes", "color": "#e74c3c"},
+            "log_spectral_norm": {"name": "log10(lambda_max)", "color": "#9b59b6"},
+            "lambda_plus": {"name": "MP edge", "color": "#1abc9c"},
+        }
+
+        for key, meta in metric_meta.items():
+            vals: list[float | None] = []
+            for snap in snapshots:
+                stat = next((s for s in snap.get("weight_stats", []) if s.get("layer") == selected_layer), None)
+                val = stat.get(key) if stat else None
+                vals.append(float(val) if isinstance(val, (int, float)) else None)
+            if any(v is not None for v in vals):
+                multi.add_trace(go.Scatter(
+                    x=checkpoint_names,
+                    y=vals,
+                    mode="lines+markers",
+                    name=meta["name"],
+                    line={"color": meta["color"]},
+                ))
+
+        multi.add_vline(
+            x=selected_name,
+            line_width=2,
+            line_dash="dash",
+            line_color="#dc3545",
+        )
+
+        multi.update_layout(
+            **plotly_layout(title=f"Layer Metrics - {short_layer(selected_layer)}"),
+            height=360,
+            xaxis_title="Checkpoint",
+            yaxis_title="Metric value",
+        )
+
+        for i, snap in enumerate(snapshots):
+            stat = next((s for s in snap.get("weight_stats", []) if s.get("layer") == selected_layer), None)
+            if not stat or not stat.get("esd"):
+                continue
+            evals = [float(v) for v in stat.get("esd", []) if isinstance(v, (int, float)) and v > 0]
+            if not evals:
+                continue
+            evals = sorted(evals, reverse=True)
+            esd_fig.add_trace(go.Scatter(
+                x=list(range(1, len(evals) + 1)),
+                y=evals,
+                mode="lines",
+                name=snap.get("name", f"ckpt_{i}"),
+                line={
+                    "color": SERIES_COLORS[i % len(SERIES_COLORS)],
+                    "width": 3 if snap.get("name") == selected_name else 1.5,
+                },
+                opacity=1.0 if snap.get("name") == selected_name else 0.45,
+                hovertemplate="rank=%{x}<br>eigenvalue=%{y:.4g}<extra></extra>",
+            ))
+
+            lambda_plus = stat.get("lambda_plus")
+            if isinstance(lambda_plus, (int, float)) and i == len(snapshots) - 1:
+                esd_fig.add_hline(
+                    y=float(lambda_plus),
+                    line_dash="dash",
+                    line_color="#dc3545",
+                    annotation_text=f"MP edge ({lambda_plus:.3g})",
+                    annotation_position="top right",
+                )
+
+        esd_fig.update_layout(
+            **plotly_layout(title=f"ESD Across Checkpoints - {short_layer(selected_layer)}"),
+            height=420,
+            xaxis_title="Rank",
+            yaxis_title="Eigenvalue",
+            xaxis_type="log",
+            yaxis_type="log",
+        )
+
+        return multi, esd_fig
+
+    @callback(
+        Output("ww-leaderboard-wrap", "children"),
+        Input("ww-checkpoint-select", "value", allow_optional=True),
+        Input("ww-global-metric-select", "value", allow_optional=True),
+    )
+    def _update_ww_leaderboard(selected_checkpoint, metric_key):
+        snapshots = ckpt_state.get("snapshots", [])
+        if not snapshots:
+            return dbc.Alert("No snapshots available.", color="secondary", className="mb-0")
+
+        metric_labels = {
+            "alpha": "Alpha",
+            "alpha_weighted": "Alpha Weighted",
+            "mp_softrank": "MP Softrank",
+            "num_spikes": "Spikes",
+            "log_spectral_norm": "log10(lambda_max)",
+            "lambda_plus": "MP edge (lambda+)",
+        }
+
+        snap = next((s for s in snapshots if s.get("name") == selected_checkpoint), snapshots[-1])
+        key = metric_key if metric_key in metric_labels else "alpha_weighted"
+
+        rows: list[tuple[str, float]] = []
+        for stat in snap.get("weight_stats", []):
+            layer = stat.get("layer")
+            val = stat.get(key)
+            if isinstance(layer, str) and isinstance(val, (int, float)):
+                rows.append((layer, float(val)))
+
+        if not rows:
+            return dbc.Alert(
+                f"No values for {metric_labels.get(key, key)} in checkpoint {snap.get('name', '?')}.",
+                color="secondary",
+                className="mb-0",
+            )
+
+        reverse = key not in {"mp_softrank"}
+        rows.sort(key=lambda x: x[1], reverse=reverse)
+
+        body = [
+            html.Tr([
+                html.Td(str(i + 1)),
+                html.Td(html.Code(short_layer(layer))),
+                html.Td(f"{value:.6g}"),
+            ])
+            for i, (layer, value) in enumerate(rows[:80])
+        ]
+
+        return html.Div(
+            dbc.Table([
+                html.Thead(html.Tr([
+                    html.Th("Rank"),
+                    html.Th("Layer"),
+                    html.Th(metric_labels.get(key, key)),
+                ])),
+                html.Tbody(body),
+            ], bordered=True, hover=True, responsive=True, size="sm"),
+            style={"maxHeight": "520px", "overflowY": "auto"},
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Live Training page callbacks ─────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+
+    @callback(
+        Output("live-act-chart", "figure"),
+        Output("live-act-summary", "children"),
+        Output("live-act-table", "children"),
+        Input("live-refresh", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def _update_live_activations(_n):
+        import plotly.graph_objects as go
+
+        empty = go.Figure()
+        if ipc is None:
+            return empty, "No IPC channel.", ""
+
+        entries = ipc.read_activation_stats()
+        if not entries:
+            return empty, "No activation records yet.", ""
+
+        # Group by layer, get latest step for each
+        latest: dict[str, dict] = {}
+        for e in entries:
+            layer = e.get("layer", "")
+            step = e.get("step", 0)
+            if layer not in latest or step > latest[layer].get("step", -1):
+                latest[layer] = e
+
+        layers = sorted(latest.keys())
+        if not layers:
+            return empty, "No layer data.", ""
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=[short_layer(l) for l in layers],
+            y=[latest[l].get("mean", 0) for l in layers],
+            name="mean", marker_color="#375a7f",
+        ))
+        fig.add_trace(go.Bar(
+            x=[short_layer(l) for l in layers],
+            y=[latest[l].get("std", 0) for l in layers],
+            name="std", marker_color="#e67e22",
+        ))
+        fig.update_layout(
+            **plotly_layout(title="Activation Statistics (Latest Step)"),
+            barmode="group", height=420,
+            xaxis_tickangle=-45, xaxis_title="Layer", yaxis_title="Value",
+        )
+
+        summary = f"{len(entries)} records across {len(layers)} layers"
+
+        # Build raw data table (latest per layer)
+        header = [
+            html.Th("Layer"), html.Th("Step"), html.Th("Mean"),
+            html.Th("Std"), html.Th("Min"), html.Th("Max"), html.Th("Zero%"),
+        ]
+        rows = []
+        for l in layers:
+            e = latest[l]
+            zf = e.get("zero_fraction")
+            rows.append(html.Tr([
+                html.Td(html.Code(short_layer(l))),
+                html.Td(str(e.get("step", ""))),
+                html.Td(f"{e.get('mean', 0):.4g}"),
+                html.Td(f"{e.get('std', 0):.4g}"),
+                html.Td(f"{e.get('min', 0):.4g}"),
+                html.Td(f"{e.get('max', 0):.4g}"),
+                html.Td(f"{zf * 100:.1f}" if zf is not None else "-"),
+            ]))
+
+        table = html.Div(
+            dbc.Table([
+                html.Thead(html.Tr(header)),
+                html.Tbody(rows),
+            ], bordered=True, hover=True, responsive=True, size="sm"),
+            style={"maxHeight": "500px", "overflowY": "auto"},
+        )
+        return fig, summary, table
+
+    @callback(
+        Output("live-weight-chart", "figure"),
+        Output("live-weight-summary", "children"),
+        Output("live-weight-table", "children"),
+        Input("live-refresh", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def _update_live_weights(_n):
+        import plotly.graph_objects as go
+
+        empty = go.Figure()
+        if ipc is None:
+            return empty, "No IPC channel.", ""
+
+        entries = ipc.read_weight_stats()
+        if not entries:
+            return empty, "No weight stat records yet.", ""
+
+        # Group by layer, collect time series
+        by_layer: dict[str, list[dict]] = {}
+        for e in entries:
+            layer = e.get("layer", "")
+            by_layer.setdefault(layer, []).append(e)
+
+        layers = sorted(by_layer.keys())
+        if not layers:
+            return empty, "No layers.", ""
+
+        # Show latest snapshot as bar chart
+        latest: dict[str, dict] = {}
+        for l in layers:
+            latest[l] = max(by_layer[l], key=lambda e: e.get("step", 0))
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=[short_layer(l) for l in layers if not l.endswith(".bias")],
+            y=[latest[l].get("norm_l2", 0) for l in layers if not l.endswith(".bias")],
+            name="L2 Norm", marker_color="#375a7f",
+        ))
+        fig.update_layout(
+            **plotly_layout(title="Live Weight L2 Norms"),
+            height=420, xaxis_tickangle=-45,
+            xaxis_title="Layer", yaxis_title="L2 Norm",
+        )
+
+        summary = f"{len(entries)} records across {len(layers)} params"
+
+        header = [
+            html.Th("Layer"), html.Th("Step"), html.Th("L2 Norm"),
+            html.Th("Mean"), html.Th("Std"), html.Th("Near-Zero%"),
+        ]
+        rows = []
+        for l in layers[:100]:
+            e = latest[l]
+            rows.append(html.Tr([
+                html.Td(html.Code(short_layer(l))),
+                html.Td(str(e.get("step", ""))),
+                html.Td(f"{e.get('norm_l2', 0):.4g}"),
+                html.Td(f"{e.get('mean', 0):.4g}"),
+                html.Td(f"{e.get('std', 0):.4g}"),
+                html.Td(f"{e.get('near_zero_pct', 0):.1f}"),
+            ]))
+
+        table = html.Div(
+            dbc.Table([
+                html.Thead(html.Tr(header)),
+                html.Tbody(rows),
+            ], bordered=True, hover=True, responsive=True, size="sm"),
+            style={"maxHeight": "500px", "overflowY": "auto"},
+        )
+        return fig, summary, table
+
+    @callback(
+        Output("live-optim-chart", "figure"),
+        Output("live-optim-summary", "children"),
+        Output("live-optim-table", "children"),
+        Input("live-refresh", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def _update_live_optimizer(_n):
+        import plotly.graph_objects as go
+
+        empty = go.Figure()
+        if ipc is None:
+            return empty, "No IPC channel.", ""
+
+        entries = ipc.read_optimizer_state()
+        if not entries:
+            return empty, "No optimizer state records yet.", ""
+
+        # Latest entry per optimizer/layer
+        latest: dict[str, dict] = {}
+        for e in entries:
+            key = e.get("optimizer", "") + "/" + e.get("layer", str(e.get("param_group", "")))
+            step = e.get("step", 0)
+            if key not in latest or step > latest[key].get("step", -1):
+                latest[key] = e
+
+        keys = sorted(latest.keys())
+        if not keys:
+            return empty, "No optimizer state data.", ""
+
+        # Bar chart of effective LR or exp_avg norms
+        fig = go.Figure()
+        elr_keys = [k for k in keys if latest[k].get("effective_lr") is not None]
+        if elr_keys:
+            fig.add_trace(go.Bar(
+                x=[short_layer(k) for k in elr_keys],
+                y=[latest[k]["effective_lr"] for k in elr_keys],
+                name="Effective LR", marker_color="#00bc8c",
+            ))
+            fig.update_layout(
+                **plotly_layout(title="Effective Learning Rate"),
+                height=380, xaxis_tickangle=-45,
+            )
+        else:
+            ean_keys = [k for k in keys if latest[k].get("exp_avg_norm_mean") is not None]
+            if ean_keys:
+                fig.add_trace(go.Bar(
+                    x=[short_layer(k) for k in ean_keys],
+                    y=[latest[k]["exp_avg_norm_mean"] for k in ean_keys],
+                    name="1st Moment Norm", marker_color="#375a7f",
+                ))
+                fig.update_layout(
+                    **plotly_layout(title="Optimizer 1st Moment Norms"),
+                    height=380, xaxis_tickangle=-45,
+                )
+
+        summary = f"{len(entries)} records, {len(keys)} groups"
+
+        header = [html.Th("Key"), html.Th("Step"), html.Th("Details")]
+        rows = []
+        for k in keys[:80]:
+            e = latest[k]
+            parts = []
+            for field in ("effective_lr", "exp_avg_norm_mean", "exp_avg_sq_mean",
+                          "warmup_pct", "bias_correction2"):
+                v = e.get(field)
+                if v is not None:
+                    parts.append(f"{field}={v:.4g}")
+            rows.append(html.Tr([
+                html.Td(html.Code(short_layer(k))),
+                html.Td(str(e.get("step", ""))),
+                html.Td(", ".join(parts) if parts else "-"),
+            ]))
+
+        table = html.Div(
+            dbc.Table([html.Thead(html.Tr(header)), html.Tbody(rows)],
+                      bordered=True, hover=True, responsive=True, size="sm"),
+            style={"maxHeight": "500px", "overflowY": "auto"},
+        )
+        return fig, summary, table
+
+    @callback(
+        Output("live-pred-scatter", "figure"),
+        Output("live-pred-summary", "children"),
+        Output("live-pred-table", "children"),
+        Input("live-refresh", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def _update_live_predictions(_n):
+        import plotly.graph_objects as go
+
+        empty = go.Figure()
+        if ipc is None:
+            return empty, "No IPC channel.", ""
+
+        entries = ipc.read_predictions()
+        if not entries:
+            return (
+                empty,
+                "No predictions logged yet. Use gradienthound.log_predictions() during training.",
+                "",
+            )
+
+        # Flatten all predicted/actual pairs
+        predicted = []
+        actual = []
+        for e in entries[-500:]:  # Last 500 entries
+            p = e.get("predicted")
+            a = e.get("actual")
+            if p is not None and a is not None:
+                if isinstance(p, list) and isinstance(a, list):
+                    predicted.extend(p)
+                    actual.extend(a)
+                else:
+                    predicted.append(float(p))
+                    actual.append(float(a))
+
+        if not predicted:
+            return empty, f"{len(entries)} entries but no valid predicted/actual pairs.", ""
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=actual, y=predicted, mode="markers",
+            marker={"size": 4, "color": "#375a7f", "opacity": 0.5},
+            name="predictions",
+            hovertemplate="actual=%{x:.4g}<br>predicted=%{y:.4g}<extra></extra>",
+        ))
+        # Perfect calibration line
+        all_vals = actual + predicted
+        lo, hi = min(all_vals), max(all_vals)
+        fig.add_trace(go.Scatter(
+            x=[lo, hi], y=[lo, hi], mode="lines",
+            line={"color": "#dc3545", "dash": "dash", "width": 1.5},
+            name="y=x",
+        ))
+        fig.update_layout(
+            **plotly_layout(title="Prediction Calibration"),
+            height=420, xaxis_title="Actual", yaxis_title="Predicted",
+        )
+
+        summary = f"{len(entries)} log entries, {len(predicted)} points plotted"
+
+        # Compute calibration stats
+        if predicted and actual:
+            residuals = [p - a for p, a in zip(predicted, actual)]
+            mae = sum(abs(r) for r in residuals) / len(residuals)
+            rmse = (sum(r ** 2 for r in residuals) / len(residuals)) ** 0.5
+            table = dbc.Table([
+                html.Tbody([
+                    html.Tr([html.Th("MAE"), html.Td(f"{mae:.6g}")]),
+                    html.Tr([html.Th("RMSE"), html.Td(f"{rmse:.6g}")]),
+                    html.Tr([html.Th("Points"), html.Td(str(len(predicted)))]),
+                ]),
+            ], bordered=True, size="sm")
+        else:
+            table = ""
+
+        return fig, summary, table
+
+    @callback(
+        Output("live-attn-heatmap", "figure"),
+        Output("live-attn-summary", "children"),
+        Output("live-attn-select", "options"),
+        Input("live-refresh", "n_intervals"),
+        Input("live-attn-select", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_live_attention(_n, selected_name):
+        import plotly.graph_objects as go
+
+        empty = go.Figure()
+        if ipc is None:
+            return empty, "No IPC channel.", []
+
+        entries = ipc.read_attention()
+        if not entries:
+            return (
+                empty,
+                "No attention patterns logged yet. Use gradienthound.log_attention() during training.",
+                [],
+            )
+
+        # Collect unique attention names
+        names = sorted({e.get("name", "default") for e in entries})
+        options = [{"label": n, "value": n} for n in names]
+
+        if not selected_name or selected_name not in names:
+            selected_name = names[0]
+
+        # Get the latest entry for the selected name
+        matching = [e for e in entries if e.get("name") == selected_name]
+        if not matching:
+            return empty, f"{len(entries)} entries, none for '{selected_name}'.", options
+
+        latest = matching[-1]
+        weights = latest.get("weights")
+        if weights is None or not isinstance(weights, list):
+            return empty, "Attention entry has no weight matrix.", options
+
+        fig = go.Figure(go.Heatmap(
+            z=weights,
+            colorscale="Viridis",
+            hovertemplate="row=%{y}<br>col=%{x}<br>weight=%{z:.4g}<extra></extra>",
+        ))
+        fig.update_layout(
+            **plotly_layout(title=f"Attention \u2014 {selected_name}"),
+            height=450,
+            yaxis={"autorange": "reversed"},
+            xaxis_title="Key position",
+            yaxis_title="Query position",
+        )
+
+        summary = f"{len(entries)} entries, {len(names)} heads, showing: {selected_name}"
+        return fig, summary, options
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── On-Demand Analysis page callbacks ────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+
+    @callback(
+        Output("od-heatmap-layer", "options"),
+        Input("od-model-select", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_od_layer_options(model_name):
+        if ipc is None:
+            return []
+        models = ipc.read_models()
+        model_info = models.get(model_name, {})
+        params = model_info.get("parameters", {})
+        options = []
+        for name, meta in params.items():
+            shape = meta.get("shape", [])
+            if len(shape) == 2:
+                shape_str = "x".join(str(s) for s in shape)
+                options.append({"label": f"{short_layer(name)} ({shape_str})", "value": name})
+        return options
+
+    # On-demand background task state
+    od_tasks: dict = {
+        "heatmap_req_id": None,
+        "heatmap_running": False,
+        "heatmap_result": None,
+        "cka_req_id": None,
+        "cka_running": False,
+        "cka_result": None,
+        "state_req_id": None,
+        "state_running": False,
+        "state_result": None,
+    }
+
+    def _od_poll_worker(req_id: str, task_key: str, timeout: int = 20):
+        """Background thread that polls IPC for a response."""
+        import time as _time
+        for _ in range(timeout * 2):
+            resp = ipc.read_response(req_id)
+            if resp is not None:
+                ipc.clear_response(req_id)
+                od_tasks[f"{task_key}_result"] = resp
+                od_tasks[f"{task_key}_running"] = False
+                return
+            _time.sleep(0.5)
+        od_tasks[f"{task_key}_result"] = {"error": "Timeout: training process did not respond. Ensure gradienthound.step() is being called."}
+        od_tasks[f"{task_key}_running"] = False
+
+    # ── Heatmap: submit ──────────────────────────────────────────
+    @callback(
+        Output("od-heatmap-status", "children", allow_duplicate=True),
+        Output("od-heatmap-btn", "disabled"),
+        Output("od-poll", "disabled", allow_duplicate=True),
+        Input("od-heatmap-btn", "n_clicks"),
+        State("od-model-select", "value"),
+        State("od-heatmap-layer", "value"),
+        prevent_initial_call=True,
+    )
+    def _submit_heatmap(n_clicks, model_name, layer):
+        import uuid
+        if not n_clicks or ipc is None:
+            return no_update, no_update, no_update
+        if not layer:
+            return dbc.Alert("Select a layer first.", color="warning"), False, no_update
+
+        req_id = f"heatmap_{uuid.uuid4().hex[:8]}"
+        ipc.write_request({"type": "weight_heatmap", "id": req_id, "model": model_name, "layer": layer})
+        od_tasks["heatmap_req_id"] = req_id
+        od_tasks["heatmap_running"] = True
+        od_tasks["heatmap_result"] = None
+        threading.Thread(target=_od_poll_worker, args=(req_id, "heatmap", 20), daemon=True).start()
+        return (
+            [dbc.Spinner(size="sm", spinner_class_name="me-2"), "Computing\u2026"],
+            True,
+            False,  # enable polling
+        )
+
+    # ── CKA: submit ──────────────────────────────────────────────
+    @callback(
+        Output("od-cka-status", "children", allow_duplicate=True),
+        Output("od-cka-btn", "disabled"),
+        Output("od-poll", "disabled", allow_duplicate=True),
+        Input("od-cka-btn", "n_clicks"),
+        State("od-model-select", "value"),
+        prevent_initial_call=True,
+    )
+    def _submit_cka(n_clicks, model_name):
+        import uuid
+        if not n_clicks or ipc is None:
+            return no_update, no_update, no_update
+
+        req_id = f"cka_{uuid.uuid4().hex[:8]}"
+        ipc.write_request({"type": "cka", "id": req_id, "model": model_name})
+        od_tasks["cka_req_id"] = req_id
+        od_tasks["cka_running"] = True
+        od_tasks["cka_result"] = None
+        threading.Thread(target=_od_poll_worker, args=(req_id, "cka", 30), daemon=True).start()
+        return (
+            [dbc.Spinner(size="sm", spinner_class_name="me-2"), "Computing\u2026"],
+            True,
+            False,
+        )
+
+    # ── Network state: submit ────────────────────────────────────
+    @callback(
+        Output("od-state-status", "children", allow_duplicate=True),
+        Output("od-state-btn", "disabled"),
+        Output("od-poll", "disabled", allow_duplicate=True),
+        Input("od-state-btn", "n_clicks"),
+        State("od-model-select", "value"),
+        prevent_initial_call=True,
+    )
+    def _submit_network_state(n_clicks, model_name):
+        import uuid
+        if not n_clicks or ipc is None:
+            return no_update, no_update, no_update
+
+        req_id = f"state_{uuid.uuid4().hex[:8]}"
+        ipc.write_request({"type": "network_state", "id": req_id, "model": model_name})
+        od_tasks["state_req_id"] = req_id
+        od_tasks["state_running"] = True
+        od_tasks["state_result"] = None
+        threading.Thread(target=_od_poll_worker, args=(req_id, "state", 20), daemon=True).start()
+        return (
+            [dbc.Spinner(size="sm", spinner_class_name="me-2"), "Computing\u2026"],
+            True,
+            False,
+        )
+
+    # ── On-demand polling callback ───────────────────────────────
+    @callback(
+        Output("od-heatmap-chart", "figure"),
+        Output("od-heatmap-chart", "style"),
+        Output("od-heatmap-status", "children"),
+        Output("od-heatmap-btn", "disabled", allow_duplicate=True),
+        Output("od-cka-chart", "figure"),
+        Output("od-cka-chart", "style"),
+        Output("od-cka-status", "children"),
+        Output("od-cka-btn", "disabled", allow_duplicate=True),
+        Output("od-state-result", "children"),
+        Output("od-state-status", "children"),
+        Output("od-state-btn", "disabled", allow_duplicate=True),
+        Output("od-poll", "disabled"),
+        Input("od-poll", "n_intervals"),
+        prevent_initial_call=True,
+    )
+    def _poll_on_demand(_n):
+        import plotly.graph_objects as go
+
+        hm_fig, hm_style, hm_status, hm_btn = no_update, no_update, no_update, no_update
+        cka_fig, cka_style, cka_status, cka_btn = no_update, no_update, no_update, no_update
+        st_result, st_status, st_btn = no_update, no_update, no_update
+        any_running = od_tasks["heatmap_running"] or od_tasks["cka_running"] or od_tasks["state_running"]
+
+        # ── Heatmap result ──
+        if not od_tasks["heatmap_running"] and od_tasks["heatmap_result"] is not None:
+            resp = od_tasks["heatmap_result"]
+            od_tasks["heatmap_result"] = None
+            hm_btn = False
+            if "error" in resp:
+                hm_fig = go.Figure()
+                hm_style = {"display": "none"}
+                hm_status = dbc.Alert(resp["error"], color="danger")
+            else:
+                matrix = resp.get("matrix", [])
+                layer = resp.get("layer", "?")
+                fig = go.Figure(go.Heatmap(
+                    z=matrix, colorscale="RdBu_r", zmid=0,
+                    hovertemplate="row=%{y}<br>col=%{x}<br>value=%{z:.4g}<extra></extra>",
+                ))
+                shape = resp.get("shape", [])
+                disp = resp.get("display_shape", shape)
+                sparsity = resp.get("sparsity", 0)
+                fig.update_layout(
+                    **plotly_layout(
+                        title=f"{short_layer(layer)} "
+                              f"({'x'.join(str(s) for s in shape)}, "
+                              f"displayed {'x'.join(str(s) for s in disp)}) "
+                              f"| Sparsity: {sparsity:.1f}%"
+                    ),
+                    height=500, yaxis={"autorange": "reversed"},
+                )
+                hm_fig = fig
+                hm_style = {"display": "block"}
+                hm_status = dbc.Badge("Done", color="success")
+
+        # ── CKA result ──
+        if not od_tasks["cka_running"] and od_tasks["cka_result"] is not None:
+            resp = od_tasks["cka_result"]
+            od_tasks["cka_result"] = None
+            cka_btn = False
+            if "error" in resp:
+                cka_fig = go.Figure()
+                cka_style = {"display": "none"}
+                cka_status = dbc.Alert(resp["error"], color="danger")
+            else:
+                matrix = resp.get("matrix", [])
+                names = resp.get("short_names", resp.get("layers", []))
+                fig = go.Figure(go.Heatmap(
+                    z=matrix, x=names, y=names, colorscale="Viridis",
+                    zmin=0, zmax=1,
+                    hovertemplate="%{y} vs %{x}<br>CKA=%{z:.3f}<extra></extra>",
+                ))
+                fig.update_layout(
+                    **plotly_layout(title=f"CKA Similarity ({resp.get('n', 0)} layers)"),
+                    height=550, yaxis={"autorange": "reversed"},
+                )
+                cka_fig = fig
+                cka_style = {"display": "block"}
+                cka_status = dbc.Badge("Done", color="success")
+
+        # ── Network state result ──
+        if not od_tasks["state_running"] and od_tasks["state_result"] is not None:
+            resp = od_tasks["state_result"]
+            od_tasks["state_result"] = None
+            st_btn = False
+            if "error" in resp:
+                st_result = dbc.Alert(resp["error"], color="danger")
+                st_status = ""
+            else:
+                layers = resp.get("layers", [])
+                total = resp.get("total_params", 0)
+                header = [html.Th("Parameter"), html.Th("Shape"), html.Th("Elements"),
+                          html.Th("Dtype"), html.Th("Sample Values")]
+                rows = []
+                for layer in layers:
+                    vals = layer.get("values", [])
+                    sample = ""
+                    if vals and isinstance(vals[0], list):
+                        flat = [v for row in vals[:3] for v in row[:5]]
+                        sample = ", ".join(f"{v:.4g}" for v in flat[:10])
+                        if len(flat) > 10:
+                            sample += ", ..."
+                    elif vals:
+                        sample = ", ".join(f"{v:.4g}" for v in vals[0][:10])
+                    rows.append(html.Tr([
+                        html.Td(html.Code(short_layer(layer["name"]))),
+                        html.Td("x".join(str(s) for s in layer.get("shape", []))),
+                        html.Td(f"{layer.get('numel', 0):,}"),
+                        html.Td(layer.get("dtype", "")),
+                        html.Td(html.Code(sample), style={"fontSize": "0.8em"}),
+                    ]))
+                st_result = html.Div([
+                    html.P(f"Total parameters: {total:,}", className="fw-semibold"),
+                    dbc.Table([html.Thead(html.Tr(header)), html.Tbody(rows)],
+                              bordered=True, hover=True, responsive=True, size="sm"),
+                ], style={"maxHeight": "600px", "overflowY": "auto"})
+                st_status = dbc.Badge("Done", color="success")
+
+        # Disable polling if nothing is running and all results consumed
+        still_running = od_tasks["heatmap_running"] or od_tasks["cka_running"] or od_tasks["state_running"]
+        has_pending = od_tasks["heatmap_result"] is not None or od_tasks["cka_result"] is not None or od_tasks["state_result"] is not None
+        disable_poll = not still_running and not has_pending
+
+        return (
+            hm_fig, hm_style, hm_status, hm_btn,
+            cka_fig, cka_style, cka_status, cka_btn,
+            st_result, st_status, st_btn,
+            disable_poll,
+        )
+
+    # ══════════════════════════════════════════════════════════════════
+    # ── Raw Data page callbacks ──────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════
+
+    @callback(
+        Output("raw-data-table", "children"),
+        Output("raw-data-count", "children"),
+        Input("raw-data-refresh-btn", "n_clicks"),
+        Input("raw-data-type", "value"),
+        Input("raw-data-limit", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_raw_data(_n, data_type, limit):
+        if ipc is None:
+            return "", "No IPC channel."
+
+        reader_map = {
+            "gradient_stats": ipc.read_gradient_stats,
+            "weight_stats": ipc.read_weight_stats,
+            "activation_stats": ipc.read_activation_stats,
+            "optimizer_state": ipc.read_optimizer_state,
+            "metrics": ipc.read_metrics,
+            "predictions": ipc.read_predictions,
+            "attention": ipc.read_attention,
+        }
+        reader = reader_map.get(data_type)
+        if reader is None:
+            return "", f"Unknown data type: {data_type}"
+
+        entries = reader()
+        total = len(entries)
+        if not entries:
+            return dbc.Alert("No records found.", color="secondary"), f"0 records"
+
+        limit = int(limit or 50)
+        if limit > 0:
+            entries = entries[-limit:]
+
+        # Auto-detect columns from first few entries
+        all_keys: list[str] = []
+        seen_keys: set[str] = set()
+        for e in entries[:20]:
+            for k in e:
+                if k not in seen_keys:
+                    all_keys.append(k)
+                    seen_keys.add(k)
+
+        # Skip large nested values in display
+        skip_keys = {"hist_counts", "hist_centers", "singular_values", "esd",
+                     "weights", "values", "predicted", "actual"}
+        display_keys = [k for k in all_keys if k not in skip_keys][:15]
+
+        header = [html.Th(k) for k in display_keys]
+        rows = []
+        for e in entries:
+            cells = []
+            for k in display_keys:
+                v = e.get(k)
+                if v is None:
+                    cells.append(html.Td("-", className="text-muted"))
+                elif isinstance(v, float):
+                    cells.append(html.Td(f"{v:.6g}"))
+                elif isinstance(v, list):
+                    cells.append(html.Td(f"[{len(v)} items]", className="text-muted"))
+                else:
+                    cells.append(html.Td(str(v)))
+            rows.append(html.Tr(cells))
+
+        count_text = f"{total} total records"
+        if limit > 0 and total > limit:
+            count_text += f" (showing last {limit})"
+
+        table = html.Div(
+            dbc.Table([
+                html.Thead(html.Tr(header)),
+                html.Tbody(rows),
+            ], bordered=True, hover=True, responsive=True, size="sm", striped=True),
+            style={"maxHeight": "700px", "overflowY": "auto"},
+        )
+        return table, count_text
 
     return app

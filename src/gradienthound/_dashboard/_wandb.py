@@ -135,7 +135,8 @@ def metrics_page_wandb(
         html.H5("Load Weights & Biases Run", className="card-title"),
         html.P(
             "Fetch scalar history from entity + project/run_id."
-            " Metrics are grouped by prefix before '/'.",
+            " Metrics are grouped by prefix before '/'."
+            " Runs in the background \u2014 you can navigate other pages while it fetches.",
             className="text-muted",
         ),
         dbc.Row([

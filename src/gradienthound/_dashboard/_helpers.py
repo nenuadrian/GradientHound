@@ -233,6 +233,60 @@ def compute_distribution_stats_table(
     return checkpoint_names, selected_layers, table
 
 
+def compute_scalar_metric_tables(
+    snapshots: list[dict],
+    metric_keys: list[str],
+    *,
+    max_layers: int = 50,
+) -> tuple[list[str], list[str], dict[str, list[list[float | None]]]]:
+    """Build per-layer scalar metric tables shaped ``layers x checkpoints``.
+
+    Returns ``(checkpoint_names, selected_layers, metric_tables)`` where
+    ``metric_tables[key]`` is a table of numeric values for the given metric.
+    Layers are included if they contain at least one requested metric value.
+    """
+    checkpoint_names = [snap["name"] for snap in snapshots]
+    if not snapshots or not metric_keys:
+        return checkpoint_names, [], {}
+
+    lookup = {
+        snap["name"]: {s["layer"]: s for s in snap.get("weight_stats", [])}
+        for snap in snapshots
+    }
+
+    all_layers: list[str] = []
+    seen: set[str] = set()
+    for snap in snapshots:
+        for stat in snap.get("weight_stats", []):
+            layer = stat.get("layer")
+            if not isinstance(layer, str) or layer in seen:
+                continue
+            if any(isinstance(stat.get(k), (int, float)) for k in metric_keys):
+                all_layers.append(layer)
+                seen.add(layer)
+
+    selected_layers = all_layers[:max_layers]
+    metric_tables: dict[str, list[list[float | None]]] = {k: [] for k in metric_keys}
+
+    for layer in selected_layers:
+        for metric_key in metric_keys:
+            row: list[float | None] = []
+            for snap in snapshots:
+                stat = lookup[snap["name"]].get(layer)
+                val = stat.get(metric_key) if stat else None
+                row.append(float(val) if isinstance(val, (int, float)) else None)
+            metric_tables[metric_key].append(row)
+
+    # Drop metrics with no data across all selected layers/checkpoints.
+    metric_tables = {
+        key: table
+        for key, table in metric_tables.items()
+        if any(v is not None for row in table for v in row)
+    }
+
+    return checkpoint_names, selected_layers, metric_tables
+
+
 def compute_optimizer_summary_table(
     snapshots: list[dict],
 ) -> tuple[list[str], list[dict]]:
