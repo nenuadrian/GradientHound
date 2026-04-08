@@ -23,177 +23,215 @@ GradientHound integrates with weightwatcher, fvcore, torch-pruning, graphviz, an
 
 ![com](./docs/assets/comp-graph.png)
 
+---
+
 ## Install
 
 ```bash
-pip install gradienthound            # core training capture + model export
-pip install gradienthound[torch]     # + PyTorch integration
-pip install gradienthound[dash]      # + standalone Dash dashboard
+pip install gradienthound            # core + model export
+pip install gradienthound[torch]     # + PyTorch hooks
+pip install gradienthound[dash]      # + standalone dashboard (Dash, Plotly, Cytoscape, wandb)
+pip install gradienthound[spectral]  # + WeightWatcher-style spectral metrics (powerlaw)
+pip install gradienthound[analysis]  # + FLOPs/pruning analysis (fvcore, torch-pruning)
 ```
 
-## Live training capture
+---
 
-GradientHound provides a wandb-style API that hooks into your training loop and captures rich telemetry.
-
-### Quick start
+## Quick Start
 
 ```python
-import torch
-import torch.nn as nn
-import gradienthound
+import torch, torch.nn as nn, gradienthound
 
-model = nn.Sequential(
-    nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
-    nn.Flatten(), nn.Linear(32 * 32 * 32, 10),
-)
+model = nn.Sequential(nn.Conv2d(3, 32, 3, padding=1), nn.ReLU(),
+                      nn.Flatten(), nn.Linear(32*32*32, 10))
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
-# Initialize capture for this run
 gradienthound.init(metadata={"lr": 1e-3, "batch_size": 32})
-
-# Register model + optimizer for visualization
 gradienthound.register_model("mymodel", model)
 gradienthound.register_optimizer("adam", optimizer)
-
-# Enable automatic gradient/weight capture via PyTorch hooks
 gradienthound.watch(model, name="mymodel")
 
 for epoch in range(100):
     out = model(torch.randn(8, 3, 32, 32))
     loss = nn.functional.cross_entropy(out, torch.randint(0, 10, (8,)))
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-
-    # Flush stats to the dashboard
+    optimizer.zero_grad(); loss.backward(); optimizer.step()
     gradienthound.step()
 
 gradienthound.shutdown()
 ```
 
-### API reference
+**With wandb:** call `gradienthound.capture_wandb()` after `init()` to auto-capture `wandb.log()` scalars.
 
-| Function | Description |
+---
+
+## API
+
+| Function | What it does |
 |---|---|
-| `gradienthound.init(metadata=None)` | Initialize a run and start telemetry capture. |
-| `gradienthound.register_model(name, model)` | Register an `nn.Module` for architecture visualization. |
-| `gradienthound.register_optimizer(name, optimizer)` | Register an optimizer for state inspection. |
-| `gradienthound.watch(model, name, log_gradients=True, log_activations=False, weight_every=50)` | Attach PyTorch hooks for automatic gradient/activation capture. |
-| `gradienthound.step(step=None)` | Flush buffered stats to the dashboard. Call once per training step. |
-| `gradienthound.log_weights(name=None)` | Force an immediate weight snapshot. |
-| `gradienthound.log_attention(name, weights)` | Log an attention weight matrix for heatmap visualization. |
-| `gradienthound.log_predictions(predicted, actual, name="default")` | Log predicted vs actual values for calibration plots. |
-| `gradienthound.capture_wandb()` | Monkey-patch `wandb.log()` to also capture scalars in GradientHound. |
-| `gradienthound.shutdown()` | Clean up hooks and close the active capture run. |
+| `init(metadata=None)` | Start a capture run. |
+| `register_model(name, model)` | Register an `nn.Module` for architecture viz. |
+| `register_optimizer(name, optimizer)` | Register an optimizer for state inspection. |
+| `watch(model, name, log_gradients=True, log_activations=False, weight_every=50)` | Attach hooks for automatic gradient/activation capture. |
+| `step(step=None)` | Flush buffered stats. Call once per training step. |
+| `log_weights(name=None)` | Force an immediate weight snapshot. |
+| `log_attention(name, weights)` | Log an attention matrix for heatmap viz. |
+| `log_predictions(predicted, actual, name="default")` | Log predicted vs actual for calibration plots. |
+| `capture_wandb()` | Monkey-patch `wandb.log()` to also feed GradientHound. |
+| `shutdown()` | Clean up hooks and close the run. |
+| `export_model(model, example_inputs, output, ...)` | Export model graph to `.gh.json` for offline viewing. |
 
-### Dashboard pages
+---
 
-The live UI provides eight pages, each auto-refreshing during training:
+## Standalone Dashboard
 
-- **Dashboard** -- run overview with model/optimizer summaries
-- **Metrics** -- live charts for any scalars logged via wandb or directly
-- **Architecture** -- interactive model graph with health overlays (gradient flow, activation sparsity, weight structure)
-- **Weights** -- per-layer histograms, SVD analysis, heatmaps, norms
-- **Gradients** -- gradient flow, cosine similarity, update ratios, dead neurons
-- **Training** -- prediction scatter plots, CKA similarity, attention patterns
-- **Optimizers** -- config, parameter groups, state buffers, warmup progress
-- **Network State** -- raw layer-by-layer parameter values
-
-### Integration patterns
-
-**Minimal:**
-
-```python
-gh = gradienthound.init()
-gradienthound.register_model("net", model)
-gradienthound.watch(model, "net")
-# ... train ...
-gradienthound.step()
+```bash
+python -m gradienthound --model model.gh.json                     # exported model
+python -m gradienthound --model ./exports/                        # search directory for .gh.json
+python -m gradienthound --checkpoints ckpt1.pt ckpt2.pt ckpt3.pt  # checkpoint comparison
+python -m gradienthound --checkpoints ./checkpoints/              # search directory for .pt/.pth/.ckpt
+python -m gradienthound --data-dir ./run_data                     # load live IPC data
+python -m gradienthound --port 9000 --debug                       # custom port + hot-reload
 ```
 
-**With wandb:**
+Combine flags freely: `--model`, `--checkpoints`, `--data-dir`, `--wandb-entity`/`--wandb-project-run-id`.
 
-```python
-import wandb
-wandb.init(project="my-project")
+---
 
-gradienthound.init()
-gradienthound.capture_wandb()  # auto-captures wandb.log() scalars
-```
+## Dashboard Pages
 
-**Framework integration (base trainer pattern):**
+### Dashboard (main page)
 
-If your project has a base trainer class, add GradientHound once in the base and all trainers inherit it:
+Model overview: stat cards (params, FLOPs, activation memory, checkpoint count, health counts), I/O summary, and live analysis sections (FLOPs breakdown, activation memory per module) when available.
 
-```python
-class BaseTrainer:
-    def __init__(self, seed, device):
-        ...
+When checkpoints are loaded, the dashboard shows all analysis sections below.
 
-    def register_model(self, name, model, *, step=0):
-        if gradienthound is not None:
-            gradienthound.register_model(name, model)
-            gradienthound.watch(model, name=name)
+### Architecture
 
-    def register_optimizer(self, name, optimizer):
-        if gradienthound is not None:
-            gradienthound.register_optimizer(name, optimizer)
-```
+Interactive Cytoscape.js graph of the module hierarchy. Nodes colored by type (conv, linear, norm, activation, pool, dropout, embedding). When checkpoints are loaded, nodes are health-colored (healthy/warning/critical) based on weight statistics. Click any node to see per-parameter details with mini histogram and SVD plots.
 
-## Model export
+Full ATen-level FX computation graph shown when `torch.export` data is available.
 
-Export a model's full computation graph to a JSON file for offline visualization. Uses `torch.export` to capture the ATen-level FX graph with per-op shapes, dtypes, and dataflow edges.
+### Checkpoints
 
-```python
-import torch
-import gradienthound
+Select and process checkpoint files with wildcard filtering. Displays optimizer state cards and spectral summary.
 
-model = MyModel()
-sample_input = (torch.randn(1, 3, 224, 224),)
+### WeightWatcher
 
-# Export to JSON (no weights saved, only metadata)
-gradienthound.export_model(model, sample_input, "model.gh.json")
-```
+Deep spectral analysis: global metric views (alpha, mp_softrank, etc.), heatmaps across layers and checkpoints, per-layer ESD plots. Requires the `powerlaw` package.
 
-The exported `.gh.json` file contains:
+### Gradient Flow
 
-- **Module tree** -- hierarchical nn.Module structure with per-layer parameter counts and attributes
-- **FX computation graph** -- every ATen op with input/output shapes, dtypes, and which nn.Module it belongs to
-- **Dataflow edges** -- actual tensor flow between ops, including skip connections and branching
-- **Parameter metadata** -- shape, dtype, device, requires_grad for every parameter and buffer
-- **Graph signature** -- which inputs are parameters, buffers, or user inputs
+Live gradient norm evolution across layers over training steps, cosine similarity between gradient steps, update ratios, dead neuron detection.
+
+### Metrics
+
+Time-series charts for scalars logged via wandb or directly.
+
+### On-Demand
+
+Weight heatmaps (2D matrices downsampled to 128x128), CKA similarity between all 2D layers, full network state dump (models <1M params). These are triggered from the dashboard and computed in the training process.
+
+### Tools
+
+Status dashboard showing all available capture, analysis, on-demand, and integration tools with their dependency status and links to relevant pages.
+
+---
+
+## Checkpoint Comparison Analysis
+
+All of the following are computed purely from checkpoint `.pt` files (no forward pass or training data needed). Pass checkpoints via `--checkpoints`.
+
+### Per-Parameter Statistics
+
+Computed for every tensor in each checkpoint:
+
+- **Basic**: L2 norm, Frobenius norm, mean, std, min, max, near-zero %, element count, shape, kurtosis
+- **Histogram**: 80-bin weight distribution
+- **Weight entropy**: Shannon entropy of the distribution histogram
+- **SVD** (2D weights): singular values, cumulative energy, stable rank, condition number, effective rank
+- **Spectral** (requires `powerlaw`): alpha, alpha_weighted, log_spectral_norm, mp_softrank, num_spikes, lambda_plus, ESD
+
+### Cross-Checkpoint Drift
+
+Computed between consecutive checkpoints (requires raw tensor access):
+
+- **Cosine similarity** of flattened weights
+- **Subspace overlap** of top-k right-singular vectors
+- **Linear CKA** similarity (optional, for 2D weights)
+- **True update ratio**: `||W_t - W_{t-1}|| / ||W_{t-1}||` (captures rotational changes that norm-difference misses)
+- **Delta norm**: `||W_t - W_{t-1}||`
+- **Delta direction consistency**: cosine similarity between consecutive weight *updates* -- oscillating directions indicate LR too high or saddle points
+
+### Initialization Distance
+
+Per-layer distance from the first checkpoint:
+
+- **L2 distance**, **relative distance** (`||W_t - W_0|| / ||W_0||`), and **cosine similarity** vs init
+- Shows which layers moved most from initialization vs barely trained
+
+### Anomaly Detection
+
+Automatic detection of suspicious transitions:
+
+- **Rank collapse**: effective rank ratio drops below 60%
+- **Kurtosis spikes**: absolute kurtosis change > 2.0
+- **Norm jump outliers**: L2 norm change > 2.5 robust standard deviations
+
+### Spectral Gap Ratios
+
+`sigma_i / sigma_{i+1}` for top-5 singular values. A growing gap between sigma_1 and sigma_2 signals rank-1 collapse. In attention layers, gaps relate to effective head count. Shown as summary chart, table, and per-layer detail with grouped bar chart.
+
+### Norm Velocity & Acceleration
+
+First and second discrete derivatives of L2 norm across checkpoints. Negative acceleration + positive velocity = convergence. Shown as dual-axis chart and a convergence map heatmap (green = converging, red = diverging).
+
+### Convergence Score
+
+Composite 0-100 score per layer combining cosine stability, rank stability, kurtosis stability, norm velocity, and mp_softrank trend. Shown as a summary line chart and green-yellow-red heatmap.
+
+### Training Phase Detection
+
+Automatic segmentation of the checkpoint timeline into phases (learning, plateau, instability) based on aggregate norm change intensity and cross-layer variance. Shown as a phase table with colored labels.
+
+### Cross-Layer Update Correlation
+
+Pairwise Pearson correlation of weight deltas between all 2D layers. Reveals which layers co-evolve (shared gradient signal) vs evolve independently. Shown as a heatmap for the latest transition.
+
+### Singular Value Turnover
+
+Fraction of top-k singular vectors without a strong match (overlap < 0.8) in the previous checkpoint. Also tracks principal direction stability (leading singular vector). High late-training turnover indicates the layer hasn't converged.
+
+### Optimizer State Analysis
+
+When optimizer state is present in checkpoints:
+
+- Type inference (Adam, SGD, RMSprop, Adadelta)
+- Per-group hyperparameters (LR, betas, momentum)
+- State buffer statistics (exp_avg norms, exp_avg_sq means)
+- Effective learning rate estimation: `lr / (sqrt(avg_second_moment) + eps)`
+- Bias correction and warmup progress
+
+---
+
+## Model Export
+
+Export the computation graph for offline visualization (no weights saved):
 
 ```python
 gradienthound.export_model(
     model,
-    example_inputs,         # tuple of tensors, same as model(*example_inputs)
-    output="model.gh.json", # path to write (None to just return the dict)
+    example_inputs,         # tuple of tensors
+    output="model.gh.json",
     dynamic_shapes=None,    # optional, passed to torch.export
-    strict=True,            # set False for models with data-dependent control flow
+    strict=True,            # False for data-dependent control flow
 )
 ```
 
-If `torch.export` fails (unsupported ops, dynamic control flow), the export falls back to module-tree only with a warning.
+The `.gh.json` contains: module tree, FX computation graph (ATen ops with shapes/dtypes), dataflow edges (including skip connections), parameter metadata, and graph signature.
 
-## Standalone dashboard
+Falls back to module-tree-only if `torch.export` fails.
 
-Browse exported models or saved training data without an active training process:
-
-```bash
-python -m gradienthound --model model.gh.json  # load an exported model
-python -m gradienthound --model ./checkpoints/ # load first .gh.json from a directory
-python -m gradienthound --port 9000            # custom port
-python -m gradienthound --data-dir ./run_data  # load IPC data directory
-python -m gradienthound --debug                # Dash hot-reload
-```
-
-The dashboard shows an interactive computation graph (powered by Cytoscape.js) with:
-- Nodes colored by module type (conv, linear, norm, activation, etc.)
-- Directed edges showing actual dataflow including skip connections
-- Click-to-inspect detail panel for each op
-- Zoom, pan, and drag support
-
-When a full FX computation graph is available (from `torch.export`), it displays every ATen op with shapes and module mapping. When only the module tree is available (export fallback), it displays the layer sequence instead.
+---
 
 ## License
 
