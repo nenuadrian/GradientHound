@@ -91,6 +91,79 @@ def node_detail_panel(node_data: dict):
     ]))
 
 
+def fmt_bytes(n: int | float) -> str:
+    """Format byte count as human-readable string."""
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}" if n != int(n) else f"{int(n)} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+def split_model_data_for_submodel(
+    model_data: dict, stats: list[dict], sub_model: str,
+) -> tuple[dict, list[dict]]:
+    """Extract model_data and weight stats for a single sub-model."""
+    mt = model_data.get("module_tree", {})
+    sm_modules = [
+        m for m in mt.get("modules", [])
+        if m["path"].startswith(sub_model + ".")
+    ]
+    sm_root_path = f"{sub_model}.{sub_model}"
+    sm_root = next((m for m in sm_modules if m["path"] == sm_root_path), None)
+    sm_model_data = dict(model_data)
+    sm_model_data["module_tree"] = {
+        "name": sm_root_path if sm_root else sub_model,
+        "modules": sm_modules,
+    }
+    sm_stats = [s for s in stats if s["layer"].startswith(sub_model + ".")]
+    return sm_model_data, sm_stats
+
+
+def column_summary(table: list[list[float | None]], n_cols: int):
+    """Return (means, mins, maxs) lists for each column of a metric table."""
+    means: list[float | None] = []
+    mins: list[float | None] = []
+    maxs: list[float | None] = []
+    for ci in range(n_cols):
+        col = [row[ci] for row in table if ci < len(row) and row[ci] is not None]
+        if col:
+            means.append(sum(col) / len(col))
+            mins.append(min(col))
+            maxs.append(max(col))
+        else:
+            means.append(None)
+            mins.append(None)
+            maxs.append(None)
+    return means, mins, maxs
+
+
+def summary_chart(checkpoint_names, means, mins, maxs, title, y_label):
+    """Build a mean/min/max summary line chart."""
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=checkpoint_names, y=means, mode="lines+markers",
+        name="mean", line={"color": "#375a7f", "width": 2.5},
+    ))
+    if any(v is not None for v in maxs):
+        fig.add_trace(go.Scatter(
+            x=checkpoint_names, y=maxs, mode="lines",
+            name="max", line={"color": "#e67e22", "dash": "dot"},
+        ))
+    if any(v is not None for v in mins):
+        fig.add_trace(go.Scatter(
+            x=checkpoint_names, y=mins, mode="lines",
+            name="min", line={"color": "#00bc8c", "dash": "dot"},
+        ))
+    fig.update_layout(
+        **plotly_layout(title=title), height=320,
+        xaxis_title="Checkpoint", yaxis_title=y_label,
+    )
+    return fig
+
+
 _MAX_CHART_POINTS = 5000
 
 

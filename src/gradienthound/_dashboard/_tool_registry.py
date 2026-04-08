@@ -144,7 +144,7 @@ def register_builtin_tools(
         check_has_data=lambda: (
             ipc is not None and bool(ipc.read_weight_stats(last_n=1))
         ),
-        page="/",
+        page="/weight-health",
     ))
 
     registry.register(ToolInfo(
@@ -160,7 +160,7 @@ def register_builtin_tools(
         check_has_data=lambda: (
             ipc is not None and bool(ipc.read_activation_stats(last_n=1))
         ),
-        page="/",
+        page="/weight-health",
     ))
 
     registry.register(ToolInfo(
@@ -176,7 +176,7 @@ def register_builtin_tools(
         check_has_data=lambda: (
             ipc is not None and bool(ipc.read_optimizer_state(last_n=1))
         ),
-        page="/",
+        page="/weight-health",
     ))
 
     registry.register(ToolInfo(
@@ -284,7 +284,7 @@ def register_builtin_tools(
         check_has_data=lambda: (
             ckpt_state is not None and ckpt_state.get("processed", False)
         ),
-        page="/weightwatcher",
+        page="/spectral",
     ))
 
     # ── Integration tools ──────────────────────────────────────────

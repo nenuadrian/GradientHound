@@ -19,6 +19,8 @@ GradientHound integrates with weightwatcher, fvcore, torch-pruning, graphviz, an
 
 ![dash](./docs/assets/dashboard.png)
 
+![tools](./docs/assets/tools.png)
+
 ![weightwatcher](./docs/assets/weightwatcher.png)
 
 ![com](./docs/assets/comp-graph.png)

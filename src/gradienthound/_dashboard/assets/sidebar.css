@@ -1,0 +1,94 @@
+/* GradientHound sidebar layout */
+
+/* Sidebar column */
+#gh-sidebar {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+    background-color: #f8f9fa;
+    border-right: 1px solid #dee2e6;
+    padding: 0;
+    z-index: 100;
+}
+
+/* Sidebar inner wrapper */
+.gh-sidebar-inner {
+    padding: 1rem 0;
+}
+
+/* Brand header */
+.gh-sidebar-brand {
+    padding: 0.5rem 1rem 1rem;
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: #2c3e50;
+    border-bottom: 1px solid #dee2e6;
+    margin-bottom: 0.75rem;
+}
+
+/* Model selector in sidebar */
+.gh-sidebar-model {
+    padding: 0 0.75rem 0.75rem;
+    border-bottom: 1px solid #dee2e6;
+    margin-bottom: 0.5rem;
+}
+
+.gh-sidebar-model .Select-control {
+    font-size: 0.85rem;
+}
+
+/* Category section headers */
+.gh-sidebar-category {
+    padding: 0.6rem 1rem 0.25rem;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #95a5a6;
+    margin-top: 0.25rem;
+}
+
+/* Nav links */
+#gh-sidebar .nav-link {
+    padding: 0.4rem 1rem;
+    font-size: 0.875rem;
+    color: #566573;
+    border-radius: 0;
+    transition: background-color 0.15s, color 0.15s;
+}
+
+#gh-sidebar .nav-link:hover {
+    background-color: #e9ecef;
+    color: #2c3e50;
+}
+
+#gh-sidebar .nav-link.active {
+    background-color: #375a7f;
+    color: #fff;
+    font-weight: 600;
+}
+
+/* Main content area */
+#gh-main {
+    height: 100vh;
+    overflow-y: auto;
+    padding: 0;
+}
+
+/* Background task bar */
+#bg-task-bar:not(:empty) {
+    padding: 0.5rem 1rem;
+    background-color: #fff8e1;
+    border-bottom: 1px solid #ffe082;
+}
+
+/* Utility: hide scrollbar on sidebar but keep functionality */
+#gh-sidebar::-webkit-scrollbar {
+    width: 4px;
+}
+
+#gh-sidebar::-webkit-scrollbar-thumb {
+    background-color: #ccc;
+    border-radius: 2px;
+}

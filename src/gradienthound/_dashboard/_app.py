@@ -12,7 +12,7 @@ import dash_cytoscape as cyto
 
 cyto.load_extra_layouts()
 
-from ._constants import PAGES, SERIES_COLORS, HEALTH_COLORS
+from ._constants import PAGES, PAGE_CATEGORIES, SERIES_COLORS, HEALTH_COLORS
 from ._helpers import (
     plotly_layout, short_layer, placeholder_page, node_detail_panel,
     compute_checkpoint_change_tables, render_checkpoint_change_table,
@@ -23,8 +23,10 @@ from ._helpers import (
 from ._health import weight_health
 from ._wandb import parse_wandb_project_run_id, fetch_wandb_run_metrics, metrics_page_wandb
 from ._pages import (
-    dashboard_page, gradient_flow_page, landing_page_empty,
-    checkpoints_page, checkpoints_page_empty, weightwatcher_page,
+    overview_page, landing_page_empty, architecture_page,
+    weight_health_page, distributions_page, spectral_page, dynamics_page,
+    gradient_flow_page,
+    checkpoints_page, checkpoints_page_empty,
     on_demand_page, raw_data_page, tools_page,
 )
 from ._tool_registry import ToolRegistry, ToolInfo, Requirement, register_builtin_tools
@@ -262,53 +264,38 @@ def create_app(
         "current_data": model_data,
     }
 
-    # Navbar with optional model selector
-    nav_links = [
-        dbc.NavLink(title, href=path, id=f"nav-{path}", active="exact")
-        for path, (title, _) in PAGES.items()
+    # ── Sidebar navigation ────────────────────────────────────────────
+    sidebar_children = [
+        html.Div("GradientHound", className="gh-sidebar-brand"),
     ]
-    
-    # Build navbar items
-    navbar_items = [
-        dbc.NavbarBrand("GradientHound", href="/", className="fw-bold"),
-        dbc.NavbarToggler(id="navbar-toggler", n_clicks=0),
-    ]
-    
-    # Add model selector if multiple models are available (before the collapse menu)
+
+    # Model selector (only when multiple models)
     if len(available_models) > 1:
-        navbar_items.append(
-            dbc.Nav([
-                html.Span([
-                    "Model: ",
-                    dcc.Dropdown(
-                        id="model-selector",
-                        options=[{"label": name, "value": name} for name in sorted(available_models.keys())],
-                        value=selected_model,
-                        clearable=False,
-                        style={"minWidth": "150px"},
-                        className="d-inline-block",
-                    ),
-                ], className="me-3 d-flex align-items-center gap-2"),
-            ], className="align-items-center")
+        sidebar_children.append(html.Div([
+            html.Small("Model", className="text-uppercase text-muted d-block mb-1"),
+            dcc.Dropdown(
+                id="model-selector",
+                options=[{"label": name, "value": name} for name in sorted(available_models.keys())],
+                value=selected_model,
+                clearable=False,
+            ),
+        ], className="gh-sidebar-model"))
+
+    # Build categorized nav links
+    for category, paths in PAGE_CATEGORIES.items():
+        sidebar_children.append(
+            html.Div(category, className="gh-sidebar-category"),
         )
-    
-    # Add navigation links in a collapsible section
-    navbar_items.append(
-        dbc.Collapse(
-            dbc.Nav(nav_links, className="ms-auto", navbar=True),
-            id="navbar-collapse",
-            is_open=False,
-            navbar=True,
-        )
-    )
-    
-    navbar = dbc.Navbar(
-        dbc.Container(navbar_items, fluid=True),
-        color="light",
-        dark=False,
-        sticky="top",
-        className="mb-3 shadow-sm border-bottom",
-    )
+        nav_items = []
+        for path in paths:
+            if path in PAGES:
+                title, _ = PAGES[path]
+                nav_items.append(
+                    dbc.NavLink(title, href=path, id=f"nav-{path}", active="exact"),
+                )
+        sidebar_children.append(dbc.Nav(nav_items, vertical=True, pills=True))
+
+    sidebar = html.Div(sidebar_children, className="gh-sidebar-inner")
 
     # Background task state -- shared across callbacks, mutated by threads
     bg_tasks: dict = {
@@ -346,10 +333,16 @@ def create_app(
         # Polling intervals for background tasks (disabled until a task starts)
         dcc.Interval(id="ckpt-poll", interval=1000, n_intervals=0, disabled=True),
         dcc.Interval(id="wandb-poll", interval=1000, n_intervals=0, disabled=True),
-        navbar,
         # Global background-task status bar (visible from any page)
-        html.Div(id="bg-task-bar", className="px-4"),
-        dbc.Container(html.Div(id="gh-content"), fluid=True, className="px-4"),
+        html.Div(id="bg-task-bar"),
+        dbc.Row([
+            dbc.Col(sidebar, width=2, id="gh-sidebar"),
+            dbc.Col(
+                html.Div(id="gh-content", className="px-4 py-2"),
+                width=10,
+                id="gh-main",
+            ),
+        ], className="g-0"),
     ])
 
     def _empty_gradflow_figure(message: str):
@@ -372,18 +365,6 @@ def create_app(
             }],
         )
         return fig
-
-    # ── Navbar toggle (mobile) ──────────────────────────────────────
-
-    @callback(
-        Output("navbar-collapse", "is_open"),
-        Input("navbar-toggler", "n_clicks"),
-        State("navbar-collapse", "is_open"),
-    )
-    def _toggle_navbar(n_clicks, is_open):
-        if n_clicks:
-            return not is_open
-        return is_open
 
     # ── Model selector ───────────────────────────────────────────────
 
@@ -764,16 +745,42 @@ def create_app(
     )
     def _route(pathname, ckpt_data, wandb_data, model_store_data):
         snapshots = ckpt_state["snapshots"] if ckpt_state["processed"] else None
-        
+
         # Use model data from store if available (for model switching), otherwise use initial model_data
         current_model_data = model_data
         if model_store_data and "data" in model_store_data:
             current_model_data = model_store_data["data"]
 
+        # ── MODEL ────────────────────────────────────────────────────
         if pathname is None or pathname == "/":
             if current_model_data:
-                return dashboard_page(current_model_data, snapshots=snapshots)
+                return overview_page(current_model_data, snapshots=snapshots)
             return landing_page_empty()
+
+        if pathname == "/architecture":
+            if current_model_data:
+                return architecture_page(current_model_data, snapshots=snapshots)
+            return placeholder_page("Architecture", "Load a model first.")
+
+        # ── ANALYSIS ─────────────────────────────────────────────────
+        if pathname == "/weight-health":
+            return weight_health_page(current_model_data, snapshots=snapshots)
+
+        if pathname == "/distributions":
+            return distributions_page(current_model_data, snapshots=snapshots)
+
+        if pathname == "/spectral" or pathname == "/weightwatcher":
+            return spectral_page(current_model_data, snapshots=snapshots)
+
+        if pathname == "/dynamics":
+            return dynamics_page(current_model_data, snapshots=snapshots)
+
+        # ── LIVE ─────────────────────────────────────────────────────
+        if pathname == "/gradient-flow":
+            model_names = []
+            if ipc is not None:
+                model_names = sorted(ipc.read_models().keys())
+            return gradient_flow_page(model_names=model_names)
 
         if pathname == "/metrics":
             page_data = wandb_data if wandb_data is not None else wandb_state.get("data")
@@ -783,19 +790,11 @@ def create_app(
                 default_project_run_id=wandb_state.get("project_run_id"),
             )
 
-        if pathname == "/gradient-flow":
-            model_names = []
-            if ipc is not None:
-                model_names = sorted(ipc.read_models().keys())
-            return gradient_flow_page(model_names=model_names)
-
+        # ── DATA ─────────────────────────────────────────────────────
         if pathname == "/checkpoints":
             if has_checkpoints:
                 return checkpoints_page(ckpt_state["paths"], snapshots)
             return checkpoints_page_empty()
-
-        if pathname == "/weightwatcher":
-            return weightwatcher_page(snapshots)
 
         if pathname == "/on-demand":
             model_names = sorted(ipc.read_models().keys()) if ipc else []
@@ -807,6 +806,7 @@ def create_app(
                 data_dir=str(ipc.directory) if ipc else None,
             )
 
+        # ── SYSTEM ───────────────────────────────────────────────────
         if pathname == "/tools":
             return tools_page(tool_registry.all_status())
 

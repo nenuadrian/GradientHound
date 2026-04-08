@@ -23,14 +23,26 @@ SERIES_COLORS = [
 # ── Page definitions ───────────────────────────────────────────────────
 
 PAGES = {
-    "/":               ("Dashboard",      "Model overview, weights, gradients, and health"),
-    "/gradient-flow":  ("Gradient Flow",  "Gradient magnitudes across layers"),
-    "/metrics":        ("Metrics",        "Run metrics from Weights & Biases"),
-    "/checkpoints":    ("Checkpoints",    "Compare model checkpoints"),
-    "/weightwatcher":  ("WeightWatcher",  "Spectral analysis deep-dive"),
-    "/on-demand":      ("On-Demand",      "Weight heatmaps, CKA similarity, network state"),
-    "/raw-data":       ("Raw Data",       "Browse raw captured IPC data"),
-    "/tools":          ("Tools",          "Registered tools and their status"),
+    "/":               ("Overview",           "Model summary, health, and architecture"),
+    "/architecture":   ("Architecture",       "FX graph, module tree, parameters, FLOPs"),
+    "/weight-health":  ("Weight Health",      "L2 norms, anomalies, parameter health"),
+    "/distributions":  ("Distributions",      "Histograms, statistics, kurtosis, entropy"),
+    "/spectral":       ("Spectral",           "Effective rank, SVD, ESD, WeightWatcher"),
+    "/dynamics":       ("Training Dynamics",  "Norm change, drift, velocity, convergence"),
+    "/gradient-flow":  ("Gradient Flow",      "Gradient magnitudes across layers"),
+    "/metrics":        ("Metrics",            "Run metrics from Weights & Biases"),
+    "/checkpoints":    ("Checkpoints",        "Compare model checkpoints"),
+    "/on-demand":      ("On-Demand",          "Weight heatmaps, CKA similarity"),
+    "/raw-data":       ("Raw Data",           "Browse raw captured IPC data"),
+    "/tools":          ("Tools",              "Registered tools and their status"),
+}
+
+PAGE_CATEGORIES = {
+    "MODEL":    ["/", "/architecture"],
+    "ANALYSIS": ["/weight-health", "/distributions", "/spectral", "/dynamics"],
+    "LIVE":     ["/gradient-flow", "/metrics"],
+    "DATA":     ["/checkpoints", "/on-demand", "/raw-data"],
+    "SYSTEM":   ["/tools"],
 }
 
 # ── Plotly light template ────────────────────────────────────────────
