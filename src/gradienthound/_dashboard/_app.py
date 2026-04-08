@@ -18,6 +18,7 @@ from ._helpers import (
     compute_checkpoint_change_tables, render_checkpoint_change_table,
     compute_effective_rank_table, compute_distribution_stats_table,
     compute_scalar_metric_tables,
+    compute_spectral_gap_table, compute_spectral_gap_ratios,
 )
 from ._health import weight_health
 from ._wandb import parse_wandb_project_run_id, fetch_wandb_run_metrics, metrics_page_wandb
@@ -1283,6 +1284,72 @@ def create_app(
         )
         slider_style = {"display": "block" if mode == "single" else "none"}
         return table, slider_style, checkpoint_names[idx]
+
+    # ── Spectral gap table mode callback ─────────────────────────
+
+    @callback(
+        Output("spectral-gap-table-wrap", "children"),
+        Output("spectral-gap-slider-wrap", "style"),
+        Output("spectral-gap-slider-label", "children"),
+        Input("spectral-gap-mode", "value"),
+        Input("spectral-gap-slider", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_spectral_gap_table(mode, slider_idx):
+        snapshots = ckpt_state.get("snapshots", [])
+        if not snapshots:
+            return no_update, no_update, no_update
+
+        checkpoint_names, layers, gap_table = compute_spectral_gap_table(snapshots, max_layers=50)
+        if not checkpoint_names or not layers:
+            return no_update, no_update, no_update
+
+        idx = int(slider_idx or 0)
+        idx = max(0, min(idx, len(checkpoint_names) - 1))
+
+        table = render_checkpoint_change_table(
+            checkpoint_names=checkpoint_names,
+            all_layers=layers,
+            values_table=gap_table,
+            mode=mode or "full",
+            selected_idx=idx,
+            formatter=lambda v: f"{v:.2f}",
+        )
+        slider_style = {"display": "block" if mode == "single" else "none"}
+        return table, slider_style, checkpoint_names[idx]
+
+    # ── Spectral gap detail chart callback ─────────────────────────
+
+    @callback(
+        Output("spectral-gap-detail-chart", "figure"),
+        Input("spectral-gap-layer-select", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_spectral_gap_detail(selected_layer):
+        import plotly.graph_objects as go
+        snapshots = ckpt_state.get("snapshots", [])
+        if not snapshots or not selected_layer:
+            return go.Figure()
+
+        gap_labels = ["s1/s2", "s2/s3", "s3/s4", "s4/s5", "s5/s6"]
+        fig = go.Figure()
+        for i, snap in enumerate(snapshots):
+            stat = next((s for s in snap["weight_stats"] if s["layer"] == selected_layer), None)
+            if stat and "singular_values" in stat:
+                ratios = compute_spectral_gap_ratios(stat["singular_values"], top_k=5)
+                fig.add_trace(go.Bar(
+                    x=gap_labels[:len(ratios)],
+                    y=ratios,
+                    name=snap["name"],
+                    marker_color=SERIES_COLORS[i % len(SERIES_COLORS)],
+                    opacity=0.75,
+                ))
+        fig.update_layout(
+            **plotly_layout(title=f"Spectral Gaps \u2014 {short_layer(selected_layer)}"),
+            barmode="group", height=340,
+            xaxis_title="Gap", yaxis_title="Ratio", yaxis_type="log",
+        )
+        return fig
 
     # ── Network state: health node click ────────────────────────────
 

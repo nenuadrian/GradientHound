@@ -13,6 +13,9 @@ from ._helpers import (
     compute_checkpoint_change_tables,
     render_checkpoint_change_table, compute_effective_rank_table,
     compute_distribution_stats_table, compute_scalar_metric_tables,
+    compute_spectral_gap_table, compute_spectral_gap_ratios,
+    compute_norm_velocity_table, compute_convergence_scores,
+    detect_training_phases,
 )
 from ._graph import build_fx_elements, build_module_tree_elements
 from ._health import weight_health, build_health_elements
@@ -932,6 +935,27 @@ def dashboard_page(model_data: dict, snapshots: list | None = None):
                 dcc.Graph(figure=evo_fig),
             ]), className="mb-3"))
 
+        # ── 10.2 Weight Entropy Evolution ──────────────────────────
+        entropy_ckpt_names, entropy_layers, entropy_tables = compute_scalar_metric_tables(
+            snapshots, ["weight_entropy"], max_layers=100,
+        )
+        if entropy_layers and entropy_tables and "weight_entropy" in entropy_tables and len(entropy_ckpt_names) >= 2:
+            e_means, e_mins, e_maxs = _column_summary(entropy_tables["weight_entropy"], len(entropy_ckpt_names))
+            entropy_chart = _summary_chart(
+                entropy_ckpt_names, e_means, e_mins, e_maxs,
+                "Weight Distribution Entropy", "Shannon Entropy",
+            )
+            children.append(dbc.Card(dbc.CardBody([
+                html.H5("Weight Entropy Evolution", className="card-title"),
+                html.P(
+                    "Shannon entropy of the weight distribution histogram. "
+                    "Drops indicate distribution collapse; increases indicate diffusion. "
+                    "More informative than mean/std alone.",
+                    className="text-muted",
+                ),
+                dcc.Graph(figure=entropy_chart),
+            ]), className="mb-3"))
+
         # ── 10a. WeightWatcher Metrics (curated) ───────────────────
         ww_metric_meta = {
             "alpha": {"label": "Alpha", "fmt": lambda v: f"{v:.3f}"},
@@ -1106,6 +1130,459 @@ def dashboard_page(model_data: dict, snapshots: list | None = None):
                     html.H5("Drift Summary Chart", className="card-title"),
                     html.P("Mean alignment across all layers per checkpoint.", className="text-muted"),
                     dcc.Graph(figure=drift_chart),
+                ]), className="mb-3"))
+
+        # ── 10e. Spectral Gap Ratios ──────────────────────────────
+        gap_ckpt_names, gap_layers, gap_table = compute_spectral_gap_table(snapshots, max_layers=50)
+        if gap_layers and len(gap_ckpt_names) >= 2:
+            gap_means, gap_mins, gap_maxs = _column_summary(gap_table, len(gap_ckpt_names))
+            gap_chart = _summary_chart(
+                gap_ckpt_names, gap_means, gap_mins, gap_maxs,
+                "Spectral Gap (sigma1/sigma2) Evolution", "Gap Ratio",
+            )
+            gap_slider_marks = {i: str(i + 1) for i in range(len(gap_ckpt_names))}
+            children.append(dbc.Card(dbc.CardBody([
+                html.H5("Spectral Gap Ratios", className="card-title"),
+                html.P(
+                    "Ratio of consecutive singular values (sigma1/sigma2). "
+                    "A growing gap signals rank-1 collapse; in attention layers, "
+                    "gaps relate to effective head count.",
+                    className="text-muted",
+                ),
+                dcc.Graph(figure=gap_chart),
+                dbc.RadioItems(
+                    id="spectral-gap-mode",
+                    options=[
+                        {"label": "Full table", "value": "full"},
+                        {"label": "Single checkpoint", "value": "single"},
+                    ],
+                    value="full",
+                    inline=True,
+                    className="mb-2 mt-3",
+                ),
+                html.Div([
+                    dcc.Slider(
+                        id="spectral-gap-slider",
+                        min=0,
+                        max=len(gap_ckpt_names) - 1,
+                        step=1,
+                        value=0,
+                        marks=gap_slider_marks,
+                        tooltip={"placement": "bottom", "always_visible": False},
+                    ),
+                    html.Div(
+                        [
+                            html.Span("Selected checkpoint: ", className="text-muted"),
+                            html.Span(gap_ckpt_names[0], id="spectral-gap-slider-label", className="fw-semibold"),
+                        ],
+                        className="mt-2 small",
+                    ),
+                ], id="spectral-gap-slider-wrap", style={"display": "none"}, className="mb-2"),
+                html.Div(
+                    id="spectral-gap-table-wrap",
+                    children=render_checkpoint_change_table(
+                        checkpoint_names=gap_ckpt_names,
+                        all_layers=gap_layers,
+                        values_table=gap_table,
+                        mode="full",
+                        selected_idx=0,
+                        formatter=lambda v: f"{v:.2f}",
+                    ),
+                ),
+            ]), className="mb-3"))
+
+            # Per-layer spectral gap detail chart
+            children.append(dbc.Card(dbc.CardBody([
+                html.H5("Spectral Gap Detail", className="card-title"),
+                html.P(
+                    "Select a layer to see top-5 spectral gap ratios across checkpoints.",
+                    className="text-muted",
+                ),
+                dcc.Dropdown(
+                    id="spectral-gap-layer-select",
+                    options=[{"label": short_layer(l), "value": l} for l in gap_layers],
+                    value=gap_layers[0] if gap_layers else None,
+                    className="mb-2",
+                ),
+                dcc.Graph(id="spectral-gap-detail-chart"),
+            ]), className="mb-3"))
+
+        # ── 10f. Norm Velocity & Acceleration ──────────────────────
+        if len(snapshots) >= 2:
+            vel_ckpt_names, vel_layers, vel_table, acc_table = compute_norm_velocity_table(snapshots, max_layers=100)
+            if vel_layers:
+                vel_means, vel_mins, vel_maxs = _column_summary(vel_table, len(vel_ckpt_names))
+                vel_chart = go.Figure()
+                vel_chart.add_trace(go.Scatter(
+                    x=vel_ckpt_names, y=vel_means, mode="lines+markers",
+                    name="mean velocity", line={"color": "#375a7f", "width": 2.5},
+                ))
+                vel_chart.add_trace(go.Scatter(
+                    x=vel_ckpt_names, y=vel_maxs, mode="lines",
+                    name="max", line={"color": "#e67e22", "dash": "dot"},
+                ))
+                vel_chart.add_trace(go.Scatter(
+                    x=vel_ckpt_names, y=vel_mins, mode="lines",
+                    name="min", line={"color": "#00bc8c", "dash": "dot"},
+                ))
+
+                if len(snapshots) >= 3:
+                    acc_means, _, _ = _column_summary(acc_table, len(vel_ckpt_names))
+                    vel_chart.add_trace(go.Scatter(
+                        x=vel_ckpt_names, y=acc_means, mode="lines+markers",
+                        name="mean acceleration", line={"color": "#e74c3c", "width": 2},
+                        yaxis="y2",
+                    ))
+                    vel_chart.update_layout(yaxis2={
+                        "title": "Acceleration", "overlaying": "y", "side": "right",
+                        "showgrid": False,
+                    })
+
+                vel_chart.update_layout(
+                    **plotly_layout(title="Norm Velocity & Acceleration"),
+                    height=360,
+                    xaxis_title="Checkpoint", yaxis_title="Velocity (norm delta)",
+                )
+                # Add zero line
+                vel_chart.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+
+                children.append(dbc.Card(dbc.CardBody([
+                    html.H5("Norm Velocity & Acceleration", className="card-title"),
+                    html.P(
+                        "First derivative (velocity) and second derivative (acceleration) "
+                        "of L2 norm across checkpoints. Negative acceleration with positive "
+                        "velocity indicates convergence.",
+                        className="text-muted",
+                    ),
+                    dcc.Graph(figure=vel_chart),
+                ]), className="mb-3"))
+
+                # Acceleration heatmap (convergence/divergence visual)
+                if len(snapshots) >= 3 and any(
+                    v is not None for row in acc_table for v in row
+                ):
+                    # Build sign heatmap: +1 = diverging, -1 = converging, 0 = stable
+                    acc_signs: list[list[float | None]] = []
+                    for row in acc_table:
+                        sign_row = []
+                        for v in row:
+                            if v is None:
+                                sign_row.append(None)
+                            elif abs(v) < 1e-10:
+                                sign_row.append(0.0)
+                            else:
+                                sign_row.append(1.0 if v > 0 else -1.0)
+                        acc_signs.append(sign_row)
+
+                    acc_heatmap = go.Figure(go.Heatmap(
+                        z=acc_signs,
+                        x=vel_ckpt_names,
+                        y=[short_layer(l) for l in vel_layers],
+                        colorscale=[
+                            [0, "#00bc8c"],      # green = converging (negative acc)
+                            [0.5, "#f8f9fa"],     # neutral
+                            [1, "#e74c3c"],       # red = diverging (positive acc)
+                        ],
+                        zmin=-1, zmax=1,
+                        colorbar={"title": "Accel Sign", "tickvals": [-1, 0, 1],
+                                  "ticktext": ["Converging", "Stable", "Diverging"]},
+                        hovertemplate="Layer: %{y}<br>Checkpoint: %{x}<br>Sign: %{z}<extra></extra>",
+                    ))
+                    acc_heatmap.update_layout(
+                        **plotly_layout(title="Acceleration Direction (Convergence Map)"),
+                        height=max(300, len(vel_layers) * 14 + 100),
+                        xaxis_title="Checkpoint",
+                    )
+                    children.append(dbc.Card(dbc.CardBody([
+                        html.H5("Convergence Map", className="card-title"),
+                        html.P(
+                            "Green = decelerating (converging), Red = accelerating (diverging). "
+                            "Derived from second derivative of L2 norm.",
+                            className="text-muted",
+                        ),
+                        dcc.Graph(figure=acc_heatmap),
+                    ]), className="mb-3"))
+
+        # ── 10g. Layer-wise Convergence Score ──────────────────────
+        if len(snapshots) >= 2:
+            conv_ckpt_names, conv_layers, conv_table = compute_convergence_scores(snapshots, max_layers=100)
+            if conv_layers and any(v is not None for row in conv_table for v in row):
+                conv_means, conv_mins, conv_maxs = _column_summary(conv_table, len(conv_ckpt_names))
+                conv_summary = _summary_chart(
+                    conv_ckpt_names, conv_means, conv_mins, conv_maxs,
+                    "Convergence Score Evolution", "Score (0-100)",
+                )
+
+                conv_heatmap = go.Figure(go.Heatmap(
+                    z=conv_table,
+                    x=conv_ckpt_names,
+                    y=[short_layer(l) for l in conv_layers],
+                    colorscale=[
+                        [0, "#e74c3c"],       # red = unstable
+                        [0.5, "#f39c12"],      # yellow = transitioning
+                        [1, "#00bc8c"],        # green = converged
+                    ],
+                    zmin=0, zmax=100,
+                    colorbar={"title": "Score"},
+                    hovertemplate="Layer: %{y}<br>Checkpoint: %{x}<br>Score: %{z:.1f}<extra></extra>",
+                ))
+                conv_heatmap.update_layout(
+                    **plotly_layout(title="Layer Convergence Heatmap"),
+                    height=max(300, len(conv_layers) * 14 + 100),
+                    xaxis_title="Checkpoint",
+                )
+
+                children.append(dbc.Card(dbc.CardBody([
+                    html.H5("Convergence Score", className="card-title"),
+                    html.P(
+                        "Composite score (0-100) per layer combining cosine stability, "
+                        "rank stability, kurtosis stability, norm velocity, and spectral "
+                        "structure. Higher = more converged.",
+                        className="text-muted",
+                    ),
+                    dcc.Graph(figure=conv_summary),
+                    dcc.Graph(figure=conv_heatmap),
+                ]), className="mb-3"))
+
+        # ── 10h. Training Phase Detection ──────────────────────────
+        if len(snapshots) >= 3:
+            phases = detect_training_phases(snapshots)
+            if phases:
+                phase_colors = {"learning": "#00bc8c", "plateau": "#f39c12", "instability": "#e74c3c"}
+                phase_rows = []
+                for p in phases:
+                    color = phase_colors.get(p["phase"], "#6c757d")
+                    phase_rows.append(html.Tr([
+                        html.Td(dbc.Badge(
+                            p["phase"].title(),
+                            style={"backgroundColor": color},
+                        )),
+                        html.Td(p["start_name"]),
+                        html.Td(p["end_name"]),
+                        html.Td(f"{p['intensity']:.4g}"),
+                    ]))
+
+                children.append(dbc.Card(dbc.CardBody([
+                    html.H5("Training Phases", className="card-title"),
+                    html.P(
+                        "Automatically detected training phases based on aggregate "
+                        "norm change intensity and cross-layer variance.",
+                        className="text-muted",
+                    ),
+                    html.Div([
+                        html.Span([
+                            html.Span(
+                                "",
+                                style={
+                                    "display": "inline-block", "width": "14px",
+                                    "height": "14px", "borderRadius": "3px",
+                                    "backgroundColor": color, "marginRight": "6px",
+                                    "verticalAlign": "middle",
+                                },
+                            ),
+                            html.Span(label.title(), style={"marginRight": "16px"}),
+                        ])
+                        for label, color in phase_colors.items()
+                    ], className="mb-3"),
+                    dbc.Table([
+                        html.Thead(html.Tr([
+                            html.Th("Phase"), html.Th("From"), html.Th("To"),
+                            html.Th("Mean Intensity"),
+                        ])),
+                        html.Tbody(phase_rows),
+                    ], bordered=True, hover=True, responsive=True, size="sm"),
+                ]), className="mb-3"))
+
+        # ── 10i. Update Ratio & Delta Norm ────────────────────────
+        if len(snapshots) >= 2:
+            ur_metric_meta = {
+                "update_ratio_prev": {"label": "Update Ratio (||delta||/||W||)", "fmt": lambda v: f"{v:.4g}"},
+                "delta_norm": {"label": "Delta Norm (||W_t - W_{t-1}||)", "fmt": lambda v: f"{v:.4g}"},
+            }
+            ur_ckpt_names, ur_layers, ur_tables = compute_scalar_metric_tables(
+                snapshots, list(ur_metric_meta.keys()), max_layers=50,
+            )
+            if ur_layers and ur_tables:
+                # Summary chart of update ratio
+                if "update_ratio_prev" in ur_tables and len(ur_ckpt_names) >= 2:
+                    ur_means, ur_mins, ur_maxs = _column_summary(ur_tables["update_ratio_prev"], len(ur_ckpt_names))
+                    ur_chart = _summary_chart(
+                        ur_ckpt_names, ur_means, ur_mins, ur_maxs,
+                        "True Update Ratio Evolution", "||delta|| / ||W||",
+                    )
+                    children.append(dbc.Card(dbc.CardBody([
+                        html.H5("True Update Ratio", className="card-title"),
+                        html.P(
+                            "||W_t - W_{t-1}|| / ||W_{t-1}|| per layer. Unlike the existing "
+                            "relative norm change, this captures rotational updates that preserve "
+                            "norm magnitude. Layers with very low ratios may be frozen.",
+                            className="text-muted",
+                        ),
+                        dcc.Graph(figure=ur_chart),
+                    ]), className="mb-3"))
+
+        # ── 10j. Delta Direction Consistency ───────────────────────
+        if len(snapshots) >= 3:
+            dd_ckpt_names, dd_layers, dd_tables = compute_scalar_metric_tables(
+                snapshots, ["delta_direction_consistency"], max_layers=100,
+            )
+            if dd_layers and dd_tables and "delta_direction_consistency" in dd_tables:
+                dd_table = dd_tables["delta_direction_consistency"]
+                dd_means, _, _ = _column_summary(dd_table, len(dd_ckpt_names))
+                dd_chart = _summary_chart(
+                    dd_ckpt_names, dd_means, [None] * len(dd_ckpt_names), [None] * len(dd_ckpt_names),
+                    "Delta Direction Consistency", "Cosine Similarity",
+                )
+                dd_chart.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+
+                dd_heatmap = go.Figure(go.Heatmap(
+                    z=dd_table,
+                    x=dd_ckpt_names,
+                    y=[short_layer(l) for l in dd_layers],
+                    colorscale=[
+                        [0, "#e74c3c"],       # red = oscillating
+                        [0.5, "#f8f9fa"],      # neutral
+                        [1, "#375a7f"],        # blue = consistent
+                    ],
+                    zmin=-1, zmax=1,
+                    colorbar={"title": "Cos Sim",
+                              "tickvals": [-1, 0, 1],
+                              "ticktext": ["Oscillating", "Orthogonal", "Consistent"]},
+                    hovertemplate="Layer: %{y}<br>Checkpoint: %{x}<br>Cos: %{z:.3f}<extra></extra>",
+                ))
+                dd_heatmap.update_layout(
+                    **plotly_layout(title="Delta Direction Consistency"),
+                    height=max(300, len(dd_layers) * 14 + 100),
+                    xaxis_title="Checkpoint",
+                )
+
+                children.append(dbc.Card(dbc.CardBody([
+                    html.H5("Delta Direction Consistency", className="card-title"),
+                    html.P(
+                        "Cosine similarity between consecutive weight updates (delta_t vs delta_{t-1}). "
+                        "Blue = updates move in the same direction (smooth convergence). "
+                        "Red = updates oscillate (LR too high or saddle points).",
+                        className="text-muted",
+                    ),
+                    dcc.Graph(figure=dd_chart),
+                    dcc.Graph(figure=dd_heatmap),
+                ]), className="mb-3"))
+
+        # ── 10k. Initialization Distance ───────────────────────────
+        if len(snapshots) >= 2:
+            init_metric_meta = {
+                "init_dist_relative": {"label": "Relative Distance from Init"},
+                "init_dist_cosine": {"label": "Cosine vs Init"},
+            }
+            init_ckpt_names, init_layers, init_tables = compute_scalar_metric_tables(
+                snapshots, list(init_metric_meta.keys()), max_layers=100,
+            )
+            if init_layers and init_tables:
+                init_chart = go.Figure()
+                init_colors = {"init_dist_relative": "#375a7f", "init_dist_cosine": "#e67e22"}
+                for mkey, meta in init_metric_meta.items():
+                    if mkey not in init_tables:
+                        continue
+                    m_means, _, _ = _column_summary(init_tables[mkey], len(init_ckpt_names))
+                    fig_kwargs = {}
+                    if mkey == "init_dist_cosine":
+                        fig_kwargs["yaxis"] = "y2"
+                    init_chart.add_trace(go.Scatter(
+                        x=init_ckpt_names, y=m_means, mode="lines+markers",
+                        name=meta["label"],
+                        line={"color": init_colors.get(mkey, "#375a7f")},
+                        **fig_kwargs,
+                    ))
+                init_chart.update_layout(
+                    **plotly_layout(title="Initialization Distance Evolution"),
+                    height=360,
+                    xaxis_title="Checkpoint",
+                    yaxis_title="Relative L2 Distance",
+                    yaxis2={"title": "Cosine vs Init", "overlaying": "y", "side": "right",
+                            "showgrid": False},
+                )
+
+                children.append(dbc.Card(dbc.CardBody([
+                    html.H5("Initialization Distance", className="card-title"),
+                    html.P(
+                        "How far each layer has moved from the first checkpoint. "
+                        "Layers with small distance may be undertrained; very large distances "
+                        "may indicate overfitting. Cosine measures rotational change.",
+                        className="text-muted",
+                    ),
+                    dcc.Graph(figure=init_chart),
+                ]), className="mb-3"))
+
+        # ── 10l. Cross-Layer Update Correlation ────────────────────
+        if len(snapshots) >= 2:
+            # Use the latest transition's correlation matrix
+            latest_corr = snapshots[-1].get("delta_correlation_matrix")
+            if latest_corr and isinstance(latest_corr, dict):
+                corr_layers = latest_corr.get("layers", [])
+                corr_matrix = latest_corr.get("matrix", [])
+                if corr_layers and corr_matrix:
+                    corr_fig = go.Figure(go.Heatmap(
+                        z=corr_matrix,
+                        x=[short_layer(l) for l in corr_layers],
+                        y=[short_layer(l) for l in corr_layers],
+                        colorscale="RdBu_r",
+                        zmin=-1, zmax=1,
+                        colorbar={"title": "Correlation"},
+                        hovertemplate="Row: %{y}<br>Col: %{x}<br>Corr: %{z:.3f}<extra></extra>",
+                    ))
+                    corr_fig.update_layout(
+                        **plotly_layout(title=f"Cross-Layer Update Correlation \u2014 {snapshots[-1]['name']}"),
+                        height=max(400, len(corr_layers) * 14 + 120),
+                        xaxis_tickangle=-45,
+                    )
+                    children.append(dbc.Card(dbc.CardBody([
+                        html.H5("Cross-Layer Update Correlation", className="card-title"),
+                        html.P(
+                            "Pairwise Pearson correlation of weight deltas between 2D layers. "
+                            "High correlation means layers receive similar gradient signals. "
+                            "Anti-correlation between paired layers (e.g., Q and K) is expected.",
+                            className="text-muted",
+                        ),
+                        dcc.Graph(figure=corr_fig),
+                    ]), className="mb-3"))
+
+        # ── 10m. Singular Value Turnover ───────────────────────────
+        if len(snapshots) >= 2:
+            svt_metric_meta = {
+                "sv_turnover_rate": {"label": "SV Turnover Rate"},
+                "principal_direction_stability": {"label": "Principal Direction Stability"},
+            }
+            svt_ckpt_names, svt_layers, svt_tables = compute_scalar_metric_tables(
+                snapshots, list(svt_metric_meta.keys()), max_layers=100,
+            )
+            if svt_layers and svt_tables:
+                svt_chart = go.Figure()
+                svt_colors = {"sv_turnover_rate": "#e74c3c", "principal_direction_stability": "#375a7f"}
+                for mkey, meta in svt_metric_meta.items():
+                    if mkey not in svt_tables:
+                        continue
+                    m_means, _, _ = _column_summary(svt_tables[mkey], len(svt_ckpt_names))
+                    svt_chart.add_trace(go.Scatter(
+                        x=svt_ckpt_names, y=m_means, mode="lines+markers",
+                        name=meta["label"],
+                        line={"color": svt_colors.get(mkey, "#375a7f")},
+                    ))
+                svt_chart.update_layout(
+                    **plotly_layout(title="Singular Value Dynamics"),
+                    height=360,
+                    xaxis_title="Checkpoint",
+                    yaxis_title="Rate / Stability",
+                )
+
+                children.append(dbc.Card(dbc.CardBody([
+                    html.H5("Singular Value Turnover", className="card-title"),
+                    html.P(
+                        "Turnover rate: fraction of top-k singular vectors that don't match "
+                        "the previous checkpoint (high = new directions emerging). "
+                        "Principal stability: how stable the leading singular vector is.",
+                        className="text-muted",
+                    ),
+                    dcc.Graph(figure=svt_chart),
                 ]), className="mb-3"))
 
         # ── 10b. Spectral Analysis (ESD) ────────────────────────────

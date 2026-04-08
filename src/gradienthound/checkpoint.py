@@ -303,6 +303,15 @@ def compute_tensor_stats(
         entry["hist_counts"] = counts.tolist()
         entry["hist_centers"] = bin_centers
 
+        # Weight distribution entropy (Shannon entropy of histogram)
+        total = counts.sum()
+        if total > 0:
+            p = counts / total
+            p = p[p > 1e-12]
+            entry["weight_entropy"] = -(p * p.log()).sum().item()
+        else:
+            entry["weight_entropy"] = 0.0
+
         # SVD for 2D weight matrices (skip bias)
         if data.ndim == 2 and "bias" not in param_name:
             try:
@@ -599,6 +608,234 @@ def annotate_checkpoint_events(snapshots: list[dict[str, Any]]) -> None:
         }
 
 
+def annotate_update_dynamics(snapshots: list[dict[str, Any]]) -> None:
+    """Annotate snapshots with update dynamics metrics.
+
+    Requires ``_tensor_lookup`` to be present on each snapshot.
+
+    Adds per-layer:
+    - ``update_ratio_prev``: ||W_t - W_{t-1}|| / ||W_{t-1}||
+    - ``delta_norm``: ||W_t - W_{t-1}||
+    - ``delta_direction_consistency``: cosine(delta_t, delta_{t-1})
+    - ``init_dist_l2``: ||W_t - W_0||
+    - ``init_dist_cosine``: cosine(W_t, W_0)
+    - ``init_dist_relative``: ||W_t - W_0|| / ||W_0||
+
+    Adds per-snapshot (for i >= 1):
+    - ``update_dynamics_summary``
+    """
+    import torch
+
+    if len(snapshots) < 2:
+        return
+
+    for i in range(1, len(snapshots)):
+        curr_lookup = snapshots[i].get("_tensor_lookup", {})
+        prev_lookup = snapshots[i - 1].get("_tensor_lookup", {})
+        init_lookup = snapshots[0].get("_tensor_lookup", {})
+        prev_prev_lookup = snapshots[i - 2].get("_tensor_lookup", {}) if i >= 2 else {}
+
+        if not isinstance(curr_lookup, dict) or not isinstance(prev_lookup, dict):
+            continue
+
+        curr_entries = snapshots[i].get("weight_stats", [])
+        update_ratios: list[float] = []
+        delta_norms: list[float] = []
+        direction_consistencies: list[float] = []
+        init_dists: list[float] = []
+
+        for entry in curr_entries:
+            layer = entry.get("layer")
+            if not isinstance(layer, str):
+                continue
+
+            curr_t = curr_lookup.get(layer)
+            prev_t = prev_lookup.get(layer)
+            if not isinstance(curr_t, torch.Tensor) or not isinstance(prev_t, torch.Tensor):
+                continue
+            if curr_t.numel() != prev_t.numel() or curr_t.numel() == 0:
+                continue
+
+            curr_flat = curr_t.detach().float().flatten()
+            prev_flat = prev_t.detach().float().flatten()
+            delta = curr_flat - prev_flat
+
+            # Delta norm (magnitude of update)
+            d_norm = delta.norm(2).item()
+            entry["delta_norm"] = d_norm
+            delta_norms.append(d_norm)
+
+            # True update ratio
+            prev_norm = prev_flat.norm(2).item()
+            if prev_norm > 1e-12:
+                ur = d_norm / prev_norm
+                entry["update_ratio_prev"] = ur
+                update_ratios.append(ur)
+
+            # Delta direction consistency (needs 3 consecutive checkpoints)
+            if i >= 2 and isinstance(prev_prev_lookup, dict):
+                prev_prev_t = prev_prev_lookup.get(layer)
+                if isinstance(prev_prev_t, torch.Tensor) and prev_prev_t.numel() == prev_t.numel():
+                    prev_delta = prev_flat - prev_prev_t.detach().float().flatten()
+                    d_dot = torch.dot(delta, prev_delta).item()
+                    d_denom = max(delta.norm(2).item() * prev_delta.norm(2).item(), 1e-12)
+                    consistency = max(-1.0, min(1.0, d_dot / d_denom))
+                    entry["delta_direction_consistency"] = consistency
+                    direction_consistencies.append(consistency)
+
+            # Initialization distance
+            if isinstance(init_lookup, dict):
+                init_t = init_lookup.get(layer)
+                if isinstance(init_t, torch.Tensor) and init_t.numel() == curr_t.numel():
+                    init_flat = init_t.detach().float().flatten()
+                    init_delta = curr_flat - init_flat
+                    init_d = init_delta.norm(2).item()
+                    entry["init_dist_l2"] = init_d
+
+                    init_norm = init_flat.norm(2).item()
+                    if init_norm > 1e-12:
+                        entry["init_dist_relative"] = init_d / init_norm
+
+                    cos_denom = max(curr_flat.norm(2).item() * init_norm, 1e-12) if init_norm > 1e-12 else 1e-12
+                    entry["init_dist_cosine"] = max(-1.0, min(1.0,
+                        torch.dot(curr_flat, init_flat).item() / cos_denom
+                    ))
+                    init_dists.append(init_d)
+
+        summary: dict[str, Any] = {
+            "compared_to": snapshots[i - 1].get("name"),
+        }
+        if update_ratios:
+            summary["update_ratio_mean"] = sum(update_ratios) / len(update_ratios)
+        if delta_norms:
+            summary["delta_norm_mean"] = sum(delta_norms) / len(delta_norms)
+        if direction_consistencies:
+            summary["direction_consistency_mean"] = sum(direction_consistencies) / len(direction_consistencies)
+        if init_dists:
+            summary["init_dist_mean"] = sum(init_dists) / len(init_dists)
+        snapshots[i]["update_dynamics_summary"] = summary
+
+
+def annotate_cross_layer_correlation(snapshots: list[dict[str, Any]]) -> None:
+    """Compute pairwise correlation of weight deltas between 2D layers.
+
+    Adds ``delta_correlation_matrix`` on each snapshot for i >= 1, containing:
+    - ``layers``: list of layer names
+    - ``matrix``: 2D correlation matrix (list of lists)
+    """
+    import torch
+    import numpy as np
+
+    if len(snapshots) < 2:
+        return
+
+    for i in range(1, len(snapshots)):
+        curr_lookup = snapshots[i].get("_tensor_lookup", {})
+        prev_lookup = snapshots[i - 1].get("_tensor_lookup", {})
+        if not isinstance(curr_lookup, dict) or not isinstance(prev_lookup, dict):
+            continue
+
+        # Collect deltas for 2D layers
+        layer_names: list[str] = []
+        deltas: list[list[float]] = []
+
+        for entry in snapshots[i].get("weight_stats", []):
+            layer = entry.get("layer")
+            if not isinstance(layer, str) or layer.endswith(".bias"):
+                continue
+
+            curr_t = curr_lookup.get(layer)
+            prev_t = prev_lookup.get(layer)
+            if not isinstance(curr_t, torch.Tensor) or not isinstance(prev_t, torch.Tensor):
+                continue
+            if curr_t.ndim != 2 or curr_t.shape != prev_t.shape:
+                continue
+
+            delta = (curr_t.detach().float() - prev_t.detach().float()).flatten()
+            layer_names.append(layer)
+            deltas.append(delta.tolist())
+
+        if len(layer_names) < 2:
+            continue
+
+        # Compute correlation matrix
+        # Pad/truncate deltas to same length for corrcoef
+        max_len = max(len(d) for d in deltas)
+        padded = np.zeros((len(deltas), max_len))
+        for j, d in enumerate(deltas):
+            padded[j, :len(d)] = d
+
+        corr = np.corrcoef(padded)
+        # Replace NaN with 0
+        corr = np.nan_to_num(corr, nan=0.0)
+
+        snapshots[i]["delta_correlation_matrix"] = {
+            "layers": layer_names,
+            "matrix": corr.tolist(),
+        }
+
+
+def annotate_sv_turnover(
+    snapshots: list[dict[str, Any]],
+    *,
+    top_k: int = 10,
+    overlap_threshold: float = 0.8,
+) -> None:
+    """Compute singular value turnover rate between consecutive checkpoints.
+
+    Adds per-layer:
+    - ``sv_turnover_rate``: fraction of current top-k SVD directions without
+      a strong match in the previous checkpoint
+    - ``principal_direction_stability``: |dot(u1_curr, u1_prev)| for leading
+      left singular vector
+    """
+    import torch
+
+    if len(snapshots) < 2:
+        return
+
+    for i in range(1, len(snapshots)):
+        curr_lookup = snapshots[i].get("_tensor_lookup", {})
+        prev_lookup = snapshots[i - 1].get("_tensor_lookup", {})
+        if not isinstance(curr_lookup, dict) or not isinstance(prev_lookup, dict):
+            continue
+
+        for entry in snapshots[i].get("weight_stats", []):
+            layer = entry.get("layer")
+            if not isinstance(layer, str) or layer.endswith(".bias"):
+                continue
+
+            curr_t = curr_lookup.get(layer)
+            prev_t = prev_lookup.get(layer)
+            if not isinstance(curr_t, torch.Tensor) or not isinstance(prev_t, torch.Tensor):
+                continue
+            if curr_t.ndim != 2 or curr_t.shape != prev_t.shape:
+                continue
+
+            try:
+                U_curr, _, Vh_curr = torch.linalg.svd(curr_t.detach().float(), full_matrices=False)
+                U_prev, _, Vh_prev = torch.linalg.svd(prev_t.detach().float(), full_matrices=False)
+
+                k = min(top_k, U_curr.shape[1], U_prev.shape[1])
+                if k < 1:
+                    continue
+
+                # Turnover: fraction of current top-k vectors without strong match
+                U_curr_k = U_curr[:, :k]
+                U_prev_k = U_prev[:, :k]
+                overlap_matrix = (U_curr_k.T @ U_prev_k).abs()  # k x k
+                max_overlaps = overlap_matrix.max(dim=1).values  # best match for each current vector
+                turnover = (max_overlaps < overlap_threshold).float().mean().item()
+                entry["sv_turnover_rate"] = turnover
+
+                # Principal direction stability
+                entry["principal_direction_stability"] = abs(
+                    torch.dot(U_curr[:, 0], U_prev[:, 0]).item()
+                )
+            except Exception:
+                pass
+
+
 # ── State dict detection ─────────────────────────────────────────────
 
 
@@ -851,6 +1088,9 @@ def process_checkpoints(
         compute_cka=compute_cka,
     )
     annotate_checkpoint_events(snapshots)
+    annotate_update_dynamics(snapshots)
+    annotate_cross_layer_correlation(snapshots)
+    annotate_sv_turnover(snapshots)
 
     for snapshot in snapshots:
         snapshot.pop("_tensor_lookup", None)

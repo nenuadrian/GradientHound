@@ -371,6 +371,313 @@ def compute_optimizer_evolution_table(
     return checkpoint_names, rows
 
 
+def compute_spectral_gap_table(
+    snapshots: list[dict],
+    *,
+    top_k: int = 5,
+    max_layers: int = 50,
+) -> tuple[list[str], list[str], list[list[float | None]]]:
+    """Build per-layer spectral gap ratio (sigma_1/sigma_2) table.
+
+    Returns ``(checkpoint_names, layers, gap_table)`` shaped ``layers x checkpoints``.
+    """
+    checkpoint_names = [snap["name"] for snap in snapshots]
+    all_layers: list[str] = []
+    seen: set[str] = set()
+    for snap in snapshots:
+        for stat in snap["weight_stats"]:
+            layer = stat["layer"]
+            if layer not in seen and "singular_values" in stat:
+                svs = stat["singular_values"]
+                if isinstance(svs, list) and len(svs) >= 2:
+                    all_layers.append(layer)
+                    seen.add(layer)
+
+    selected_layers = all_layers[:max_layers]
+    gap_table: list[list[float | None]] = []
+
+    for layer in selected_layers:
+        row: list[float | None] = []
+        for snap in snapshots:
+            stat = next((s for s in snap["weight_stats"] if s["layer"] == layer), None)
+            if stat and "singular_values" in stat:
+                svs = stat["singular_values"]
+                if isinstance(svs, list) and len(svs) >= 2:
+                    row.append(svs[0] / max(svs[1], 1e-12))
+                else:
+                    row.append(None)
+            else:
+                row.append(None)
+        gap_table.append(row)
+
+    return checkpoint_names, selected_layers, gap_table
+
+
+def compute_spectral_gap_ratios(
+    singular_values: list[float],
+    top_k: int = 5,
+) -> list[float]:
+    """Compute sigma_i / sigma_{i+1} for the top-k singular values."""
+    n = min(top_k, len(singular_values) - 1)
+    return [
+        singular_values[i] / max(singular_values[i + 1], 1e-12)
+        for i in range(n)
+    ]
+
+
+def compute_norm_velocity_table(
+    snapshots: list[dict],
+    max_layers: int = 50,
+) -> tuple[list[str], list[str], list[list[float | None]], list[list[float | None]]]:
+    """Build per-layer norm velocity and acceleration tables.
+
+    Returns ``(checkpoint_names, layers, velocity_table, acceleration_table)``
+    shaped ``layers x checkpoints``. First column of velocity is None (no
+    predecessor), first two columns of acceleration are None.
+    """
+    checkpoint_names = [snap["name"] for snap in snapshots]
+    all_layers: list[str] = []
+    seen: set[str] = set()
+    for snap in snapshots:
+        for stat in snap["weight_stats"]:
+            layer = stat["layer"]
+            if layer not in seen:
+                all_layers.append(layer)
+                seen.add(layer)
+
+    selected_layers = all_layers[:max_layers]
+    lookup = {
+        snap["name"]: {s["layer"]: s for s in snap["weight_stats"]}
+        for snap in snapshots
+    }
+
+    velocity_table: list[list[float | None]] = []
+    acceleration_table: list[list[float | None]] = []
+
+    for layer in selected_layers:
+        norms: list[float | None] = []
+        for snap in snapshots:
+            stat = lookup[snap["name"]].get(layer)
+            norms.append(stat.get("norm_l2") if stat else None)
+
+        vel_row: list[float | None] = [None]
+        for i in range(1, len(norms)):
+            if norms[i] is not None and norms[i - 1] is not None:
+                vel_row.append(norms[i] - norms[i - 1])
+            else:
+                vel_row.append(None)
+
+        acc_row: list[float | None] = [None, None] if len(norms) >= 2 else [None]
+        for i in range(2, len(vel_row)):
+            if vel_row[i] is not None and vel_row[i - 1] is not None:
+                acc_row.append(vel_row[i] - vel_row[i - 1])
+            else:
+                acc_row.append(None)
+
+        velocity_table.append(vel_row)
+        acceleration_table.append(acc_row)
+
+    return checkpoint_names, selected_layers, velocity_table, acceleration_table
+
+
+def compute_convergence_scores(
+    snapshots: list[dict],
+    max_layers: int = 50,
+) -> tuple[list[str], list[str], list[list[float | None]]]:
+    """Compute a composite convergence score (0-100) per layer per checkpoint.
+
+    Higher = more converged/stable. Combines cosine stability, rank stability,
+    kurtosis stability, norm velocity, and mp_softrank trend.
+
+    Returns ``(checkpoint_names, layers, score_table)`` shaped ``layers x checkpoints``.
+    First checkpoint column is None.
+    """
+    checkpoint_names = [snap["name"] for snap in snapshots]
+    if len(snapshots) < 2:
+        return checkpoint_names, [], []
+
+    all_layers: list[str] = []
+    seen: set[str] = set()
+    for snap in snapshots:
+        for stat in snap["weight_stats"]:
+            layer = stat["layer"]
+            if layer not in seen:
+                all_layers.append(layer)
+                seen.add(layer)
+
+    selected_layers = all_layers[:max_layers]
+    lookup = {
+        snap["name"]: {s["layer"]: s for s in snap["weight_stats"]}
+        for snap in snapshots
+    }
+
+    score_table: list[list[float | None]] = []
+
+    for layer in selected_layers:
+        row: list[float | None] = [None]
+        for i in range(1, len(snapshots)):
+            curr = lookup[snapshots[i]["name"]].get(layer)
+            prev = lookup[snapshots[i - 1]["name"]].get(layer)
+            if not curr or not prev:
+                row.append(None)
+                continue
+
+            components: list[float] = []
+
+            # 1. Cosine stability (drift_cosine_prev: 1.0 = identical, already [−1, 1])
+            cosine = curr.get("drift_cosine_prev")
+            if cosine is not None:
+                components.append(max(0.0, (cosine + 1.0) / 2.0))  # map [-1,1] -> [0,1]
+
+            # 2. Rank stability: ratio of effective ranks close to 1.0
+            er_curr = curr.get("effective_rank")
+            er_prev = prev.get("effective_rank")
+            if er_curr is not None and er_prev is not None and er_prev > 0:
+                ratio = min(er_curr, er_prev) / max(er_curr, er_prev)
+                components.append(ratio)
+
+            # 3. Kurtosis stability: small absolute delta = stable
+            k_curr = curr.get("kurtosis")
+            k_prev = prev.get("kurtosis")
+            if k_curr is not None and k_prev is not None:
+                k_delta = abs(k_curr - k_prev)
+                components.append(max(0.0, 1.0 - k_delta / 10.0))
+
+            # 4. Norm velocity: small relative change = stable
+            n_curr = curr.get("norm_l2", 0)
+            n_prev = prev.get("norm_l2", 0)
+            if n_prev > 1e-12:
+                rel_change = abs(n_curr - n_prev) / n_prev
+                components.append(max(0.0, 1.0 - min(rel_change * 10, 1.0)))
+
+            # 5. MP softrank trend: decreasing = learning structure
+            mp_curr = curr.get("mp_softrank")
+            mp_prev = prev.get("mp_softrank")
+            if mp_curr is not None and mp_prev is not None:
+                # Lower mp_softrank = more structured = better
+                components.append(max(0.0, 1.0 - mp_curr))
+
+            if components:
+                score = sum(components) / len(components) * 100
+                row.append(round(score, 1))
+            else:
+                row.append(None)
+
+        score_table.append(row)
+
+    return checkpoint_names, selected_layers, score_table
+
+
+def detect_training_phases(
+    snapshots: list[dict],
+) -> list[dict]:
+    """Detect training phases from checkpoint transitions.
+
+    Returns a list of phase dicts with:
+    - ``start_idx``, ``end_idx``: checkpoint indices
+    - ``start_name``, ``end_name``: checkpoint names
+    - ``phase``: "learning", "plateau", or "instability"
+    - ``intensity``: mean relative norm change in this phase
+    """
+    if len(snapshots) < 3:
+        return []
+
+    # Compute mean relative norm change per transition
+    intensities: list[float] = []
+    for i in range(1, len(snapshots)):
+        rel_changes: list[float] = []
+        for stat_curr in snapshots[i]["weight_stats"]:
+            layer = stat_curr["layer"]
+            stat_prev = next(
+                (s for s in snapshots[i - 1]["weight_stats"] if s["layer"] == layer),
+                None,
+            )
+            if stat_prev:
+                n_prev = stat_prev.get("norm_l2", 0)
+                n_curr = stat_curr.get("norm_l2", 0)
+                if n_prev > 1e-12:
+                    rel_changes.append(abs(n_curr - n_prev) / n_prev)
+        intensities.append(sum(rel_changes) / max(len(rel_changes), 1))
+
+    if not intensities:
+        return []
+
+    # Compute thresholds using percentiles
+    sorted_i = sorted(intensities)
+    n = len(sorted_i)
+    p25 = sorted_i[max(0, n // 4)]
+    p75 = sorted_i[min(n - 1, 3 * n // 4)]
+
+    # Also compute per-transition variance across layers (for instability detection)
+    variances: list[float] = []
+    for i in range(1, len(snapshots)):
+        rel_changes: list[float] = []
+        for stat_curr in snapshots[i]["weight_stats"]:
+            layer = stat_curr["layer"]
+            stat_prev = next(
+                (s for s in snapshots[i - 1]["weight_stats"] if s["layer"] == layer),
+                None,
+            )
+            if stat_prev:
+                n_prev = stat_prev.get("norm_l2", 0)
+                n_curr = stat_curr.get("norm_l2", 0)
+                if n_prev > 1e-12:
+                    rel_changes.append(abs(n_curr - n_prev) / n_prev)
+        if len(rel_changes) >= 2:
+            mean_rc = sum(rel_changes) / len(rel_changes)
+            var = sum((x - mean_rc) ** 2 for x in rel_changes) / len(rel_changes)
+            variances.append(var)
+        else:
+            variances.append(0.0)
+
+    var_sorted = sorted(variances)
+    var_p75 = var_sorted[min(len(var_sorted) - 1, 3 * len(var_sorted) // 4)]
+
+    # Classify each transition
+    labels: list[str] = []
+    for j, intensity in enumerate(intensities):
+        if variances[j] > var_p75 * 2 and intensity > p25:
+            labels.append("instability")
+        elif intensity <= p25:
+            labels.append("plateau")
+        else:
+            labels.append("learning")
+
+    # Merge consecutive same-phase labels into phase segments
+    phases: list[dict] = []
+    if not labels:
+        return []
+
+    current_phase = labels[0]
+    start = 0
+    for j in range(1, len(labels)):
+        if labels[j] != current_phase:
+            phase_intensities = intensities[start:j]
+            phases.append({
+                "start_idx": start,
+                "end_idx": j,
+                "start_name": snapshots[start]["name"],
+                "end_name": snapshots[j]["name"],
+                "phase": current_phase,
+                "intensity": sum(phase_intensities) / max(len(phase_intensities), 1),
+            })
+            current_phase = labels[j]
+            start = j
+
+    # Final segment
+    phase_intensities = intensities[start:]
+    phases.append({
+        "start_idx": start,
+        "end_idx": len(labels),
+        "start_name": snapshots[start]["name"],
+        "end_name": snapshots[len(labels)]["name"],
+        "phase": current_phase,
+        "intensity": sum(phase_intensities) / max(len(phase_intensities), 1),
+    })
+
+    return phases
+
+
 def render_checkpoint_change_table(
     checkpoint_names: list[str],
     all_layers: list[str],
