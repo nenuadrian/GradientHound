@@ -8,6 +8,14 @@ Mainly post-training tooling inspect model architectures, gradients, weights, an
 
 This is mainly designed to work with my framework of training and my needs, and it is unlikely to work as is for anyone else in its current form, but it might be something useful to have around, bringing together multiple tools for network introspection, and hopefully develop over time a holistic analysis framework that can adapt to any model.
 
+GradientHound integrates with weightwatcher, fvcore, torch-pruning, graphviz, cytoscape and others libraries to try and provide a comprehensive view of the model's structure and training dynamics.
+
+![dash](./docs/assets/dashboard.png)
+
+![weightwatcher](./docs/assets/weightwatcher.png)
+
+![com](./docs/assets/comp-graph.png)
+
 ## Install
 
 ```bash
