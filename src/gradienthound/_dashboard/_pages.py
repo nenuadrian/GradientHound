@@ -5,3 +5,4 @@ from ._page_checkpoints import checkpoints_page, checkpoints_page_empty  # noqa:
 from ._page_weightwatcher import weightwatcher_page  # noqa: F401
 from ._page_on_demand import on_demand_page  # noqa: F401
 from ._page_raw_data import raw_data_page  # noqa: F401
+from ._page_tools import tools_page  # noqa: F401

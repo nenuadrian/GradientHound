@@ -31,6 +31,7 @@ class GradientHound:
         self._wandb_original_log: Any = None
         self._step: int = 0
         self._last_flushed_step: int | None = None
+        self._shutdown_called: bool = False
 
         self._ipc.write_metadata(self._metadata)
 
@@ -286,14 +287,31 @@ class GradientHound:
             self._wandb_original_log = None
 
     def shutdown(self) -> None:
-        """Clean up hooks, wandb patching, and IPC resources."""
-        self._restore_wandb()
+        """Clean up hooks, wandb patching, and IPC resources.
 
-        for ws in self._watches.values():
-            ws.remove_hooks()
-        self._watches.clear()
+        Idempotent -- safe to call more than once (e.g. from both a
+        ``with`` block and the atexit handler).
+        """
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
 
-        self._ipc.cleanup()
+        try:
+            self._restore_wandb()
+        except Exception:
+            pass
+
+        try:
+            for ws in self._watches.values():
+                ws.remove_hooks()
+            self._watches.clear()
+        except Exception:
+            pass
+
+        try:
+            self._ipc.cleanup()
+        except Exception:
+            pass
 
     def __enter__(self) -> GradientHound:
         return self

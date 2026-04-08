@@ -30,6 +30,7 @@ PAGES = {
     "/weightwatcher":  ("WeightWatcher",  "Spectral analysis deep-dive"),
     "/on-demand":      ("On-Demand",      "Weight heatmaps, CKA similarity, network state"),
     "/raw-data":       ("Raw Data",       "Browse raw captured IPC data"),
+    "/tools":          ("Tools",          "Registered tools and their status"),
 }
 
 # ── Plotly light template ────────────────────────────────────────────

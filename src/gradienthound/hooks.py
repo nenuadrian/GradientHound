@@ -17,6 +17,11 @@ if TYPE_CHECKING:
     from .ipc import IPCChannel
 
 _MAX_HEATMAP_DIM = 128
+# Maximum number of unflushed records held in memory per buffer.
+# Each record is a small dict (~10 floats), so 10 000 entries ≈ 1–2 MB.
+# If step() is not called frequently enough the oldest entries are dropped
+# to prevent unbounded memory growth.
+_MAX_BUFFER_SIZE = 10_000
 
 
 class WatchState:
@@ -109,6 +114,8 @@ class WatchState:
         }
         if cosine_sim is not None:
             rec["cosine_sim"] = cosine_sim
+        if len(self._grad_buffer) >= _MAX_BUFFER_SIZE:
+            self._grad_buffer.pop(0)
         self._grad_buffer.append(rec)
 
     # ── Activation hooks ──────────────────────────────────────────────
@@ -128,6 +135,8 @@ class WatchState:
         if not isinstance(output, torch.Tensor):
             return
         flat = output.data.flatten().float()
+        if len(self._activation_buffer) >= _MAX_BUFFER_SIZE:
+            self._activation_buffer.pop(0)
         self._activation_buffer.append({
             "layer": layer_name,
             "mean": flat.mean().item(),

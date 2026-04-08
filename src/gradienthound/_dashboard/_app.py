@@ -24,8 +24,9 @@ from ._wandb import parse_wandb_project_run_id, fetch_wandb_run_metrics, metrics
 from ._pages import (
     dashboard_page, gradient_flow_page, landing_page_empty,
     checkpoints_page, checkpoints_page_empty, weightwatcher_page,
-    on_demand_page, raw_data_page,
+    on_demand_page, raw_data_page, tools_page,
 )
+from ._tool_registry import ToolRegistry, ToolInfo, Requirement, register_builtin_tools
 
 
 def _merge_model_exports(gh_files: list[Path]) -> dict:
@@ -320,6 +321,21 @@ def create_app(
         "wandb_data": None,
         "wandb_message": None,
     }
+
+    # ── Tool registry ──────────────────────────────────────────────
+    tool_registry = ToolRegistry()
+    register_builtin_tools(
+        tool_registry,
+        ipc=ipc,
+        has_checkpoints=has_checkpoints,
+        ckpt_state=ckpt_state,
+        wandb_state=wandb_state,
+        model_data=model_data,
+    )
+    # Expose registry on the app so 3rd parties can register tools:
+    #   app = create_app(...)
+    #   app.tool_registry.register(ToolInfo(...))
+    app.tool_registry = tool_registry  # type: ignore[attr-defined]
 
     app.layout = html.Div([
         dcc.Location(id="url", refresh=False),
@@ -789,6 +805,9 @@ def create_app(
                 has_ipc=ipc is not None,
                 data_dir=str(ipc.directory) if ipc else None,
             )
+
+        if pathname == "/tools":
+            return tools_page(tool_registry.all_status())
 
         if pathname in PAGES:
             title, desc = PAGES[pathname]
@@ -1659,13 +1678,30 @@ def create_app(
         "state_result": None,
     }
 
-    def _od_poll_worker(req_id: str, task_key: str, timeout: int = 20):
-        """Background thread that polls IPC for a response."""
+    def _od_poll_worker(req_id: str, task_key: str, ipc_channel, timeout: int = 20):
+        """Background thread that polls IPC for a response.
+
+        Receives ``ipc_channel`` as an explicit argument rather than
+        capturing it from the enclosing scope, so stale-reference bugs
+        are avoided if the surrounding state changes after the thread starts.
+        """
         import time as _time
+        if ipc_channel is None:
+            od_tasks[f"{task_key}_result"] = {"error": "No IPC channel configured."}
+            od_tasks[f"{task_key}_running"] = False
+            return
         for _ in range(timeout * 2):
-            resp = ipc.read_response(req_id)
+            try:
+                resp = ipc_channel.read_response(req_id)
+            except Exception as exc:
+                od_tasks[f"{task_key}_result"] = {"error": f"IPC read failed: {exc}"}
+                od_tasks[f"{task_key}_running"] = False
+                return
             if resp is not None:
-                ipc.clear_response(req_id)
+                try:
+                    ipc_channel.clear_response(req_id)
+                except Exception:
+                    pass
                 od_tasks[f"{task_key}_result"] = resp
                 od_tasks[f"{task_key}_running"] = False
                 return
@@ -1695,7 +1731,7 @@ def create_app(
         od_tasks["heatmap_req_id"] = req_id
         od_tasks["heatmap_running"] = True
         od_tasks["heatmap_result"] = None
-        threading.Thread(target=_od_poll_worker, args=(req_id, "heatmap", 20), daemon=True).start()
+        threading.Thread(target=_od_poll_worker, args=(req_id, "heatmap", ipc, 20), daemon=True).start()
         return (
             [dbc.Spinner(size="sm", spinner_class_name="me-2"), "Computing\u2026"],
             True,
@@ -1721,7 +1757,7 @@ def create_app(
         od_tasks["cka_req_id"] = req_id
         od_tasks["cka_running"] = True
         od_tasks["cka_result"] = None
-        threading.Thread(target=_od_poll_worker, args=(req_id, "cka", 30), daemon=True).start()
+        threading.Thread(target=_od_poll_worker, args=(req_id, "cka", ipc, 30), daemon=True).start()
         return (
             [dbc.Spinner(size="sm", spinner_class_name="me-2"), "Computing\u2026"],
             True,
@@ -1747,7 +1783,7 @@ def create_app(
         od_tasks["state_req_id"] = req_id
         od_tasks["state_running"] = True
         od_tasks["state_result"] = None
-        threading.Thread(target=_od_poll_worker, args=(req_id, "state", 20), daemon=True).start()
+        threading.Thread(target=_od_poll_worker, args=(req_id, "state", ipc, 20), daemon=True).start()
         return (
             [dbc.Spinner(size="sm", spinner_class_name="me-2"), "Computing\u2026"],
             True,
@@ -1963,5 +1999,31 @@ def create_app(
             style={"maxHeight": "700px", "overflowY": "auto"},
         )
         return table, count_text
+
+    # ── Tools page refresh callback ──────────────────────────────
+
+    @callback(
+        Output("tools-card-container", "children"),
+        Input("tools-refresh-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def _refresh_tools(_n_clicks):
+        from ._page_tools import _tool_card, _CATEGORY_BADGE
+        tools = tool_registry.all_status()
+
+        category_order = ["capture", "on-demand", "analysis", "integration"]
+        categories: dict[str, list] = {}
+        for t in tools:
+            categories.setdefault(t["category"], []).append(t)
+
+        ordered_cats = [c for c in category_order if c in categories]
+        ordered_cats += [c for c in categories if c not in ordered_cats]
+
+        sections = []
+        for cat in ordered_cats:
+            cat_label = _CATEGORY_BADGE.get(cat, (cat.title(), "secondary"))[0]
+            sections.append(html.H4(cat_label, className="mt-4 mb-3"))
+            sections.append(dbc.Row([_tool_card(t) for t in categories[cat]]))
+        return sections
 
     return app

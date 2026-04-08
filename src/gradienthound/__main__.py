@@ -43,6 +43,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if not (1 <= args.port <= 65535):
+        parser.error(f"--port must be between 1 and 65535, got {args.port}")
+
     from gradienthound._dashboard import create_app
     from gradienthound.checkpoint import discover_checkpoints, discover_model_exports
 

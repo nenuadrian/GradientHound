@@ -4,6 +4,7 @@ import json
 import shutil
 import sqlite3
 import tempfile
+import threading
 from pathlib import Path
 
 
@@ -33,20 +34,24 @@ class IPCChannel:
 
         self._db_path = self._dir / self._DB_NAME
         self._conn: sqlite3.Connection | None = None
+        self._conn_lock = threading.Lock()
         self._ensure_schema()
 
     # ── Connection management ────────────────────────────────────────
 
     def _get_conn(self) -> sqlite3.Connection:
         if self._conn is None:
-            self._conn = sqlite3.connect(
-                str(self._db_path),
-                check_same_thread=False,
-                timeout=10,
-            )
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
+            with self._conn_lock:
+                if self._conn is None:  # double-checked locking
+                    conn = sqlite3.connect(
+                        str(self._db_path),
+                        check_same_thread=False,
+                        timeout=10,
+                    )
+                    conn.execute("PRAGMA journal_mode=WAL")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    conn.execute("PRAGMA busy_timeout=5000")
+                    self._conn = conn
         return self._conn
 
     def _ensure_schema(self) -> None:
