@@ -11,22 +11,11 @@ theme:
   name: material
   language: en
   features:
-    - navigation.tabs
     - navigation.top
     - content.code.copy
-  palette:
-    - scheme: slate
-      primary: black
-      accent: lime
-  font:
-    text: Fira Sans
-    code: Fira Code
 
 markdown_extensions:
   - admonition
   - codehilite
   - toc:
       permalink: true
-
-extra_css:
-  - assets/stylesheets/extra.css
