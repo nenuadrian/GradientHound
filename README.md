@@ -1,14 +1,21 @@
 # GradientHound
 
+> **Beta** — core functionality is stable; some rough edges remain. See [Known Limitations](#known-limitations).
+
 <p align="center">
     <img src="https://github.com/nenuadrian/GradientHound/blob/main/docs/assets/logo.png?raw=true" alt="logo" />
 </p>
 
-Mainly post-training tooling inspect model architectures, gradients, weights, and optimizer state. With hooks that can be added to existing training frameworks to capture model configurations. Expectations that regular checkpoints are created and are made available when running GH.
+Post-training tooling to inspect PyTorch model architectures, gradients, weights, and optimizer state in real time. Drop a few lines into any training loop and get a live Dash dashboard showing gradient flow, weight health, spectral metrics, attention patterns, and more.
 
-This is mainly designed to work with my framework of training and my needs, and it is unlikely to work as is for anyone else in its current form, but it might be something useful to have around, bringing together multiple tools for network introspection, and hopefully develop over time a holistic analysis framework that can adapt to any model.
+GradientHound integrates with weightwatcher, fvcore, torch-pruning, graphviz, and Cytoscape to provide a comprehensive view of model structure and training dynamics.
 
-GradientHound integrates with weightwatcher, fvcore, torch-pruning, graphviz, cytoscape and others libraries to try and provide a comprehensive view of the model's structure and training dynamics.
+## Known Limitations
+
+- **Framework assumptions** — the hook-based capture is tested primarily against standard PyTorch training loops. Custom autograd functions or compiled models (`torch.compile`) may require manual step calls.
+- **Single-machine IPC** — the training process and dashboard currently communicate via a local SQLite database; remote GPU jobs require mounting the run directory or a future socket transport.
+- **`torch.export` coverage** — FX graph export falls back to module-tree-only for models with data-dependent control flow or unsupported ops.
+- **Scale** — designed for research-scale models. Very large models (>1B parameters) may produce high-volume telemetry; use `weight_every` and `log_activations=False` to reduce write load.
 
 ![dash](./docs/assets/dashboard.png)
 

@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
+import sqlite3
 import tempfile
 from pathlib import Path
 
 
 class IPCChannel:
-    """File-based IPC between training capture and dashboard consumers."""
+    """SQLite-backed IPC between training capture and dashboard consumers.
+
+    Replaces the previous file-based JSONL implementation with a single
+    SQLite database.  Uses WAL mode so the training process can write
+    while the dashboard reads concurrently.
+
+    Public API is unchanged -- every ``read_*`` / ``append_*`` / ``write_*``
+    method keeps its original signature.  Read methods gain optional
+    keyword-only filters (``step_min``, ``step_max``, ``model``, ``last_n``)
+    that push filtering into SQL for better performance on large runs.
+    """
+
+    _DB_NAME = "gradienthound.db"
 
     def __init__(self, directory: Path | str | None = None) -> None:
         if directory is None:
@@ -16,222 +28,421 @@ class IPCChannel:
             self._owns_dir = True
         else:
             self._dir = Path(directory)
+            self._dir.mkdir(parents=True, exist_ok=True)
             self._owns_dir = False
-        self._jsonl_cache: dict[str, dict] = {}
+
+        self._db_path = self._dir / self._DB_NAME
+        self._conn: sqlite3.Connection | None = None
+        self._ensure_schema()
+
+    # ── Connection management ────────────────────────────────────────
+
+    def _get_conn(self) -> sqlite3.Connection:
+        if self._conn is None:
+            self._conn = sqlite3.connect(
+                str(self._db_path),
+                check_same_thread=False,
+                timeout=10,
+            )
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+        return self._conn
+
+    def _ensure_schema(self) -> None:
+        conn = self._get_conn()
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS kv_store (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS events (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel   TEXT NOT NULL,
+                step      INTEGER,
+                model     TEXT,
+                layer     TEXT,
+                timestamp REAL,
+                data      TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_events_channel
+                ON events(channel);
+            CREATE INDEX IF NOT EXISTS idx_events_channel_step
+                ON events(channel, step);
+            CREATE INDEX IF NOT EXISTS idx_events_channel_model
+                ON events(channel, model);
+            CREATE INDEX IF NOT EXISTS idx_events_channel_model_step
+                ON events(channel, model, step);
+
+            CREATE TABLE IF NOT EXISTS requests (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                data TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS responses (
+                request_id TEXT PRIMARY KEY,
+                data       TEXT NOT NULL
+            );
+        """)
+        conn.commit()
 
     @property
     def directory(self) -> Path:
         return self._dir
 
-    # ── Atomic JSON read/write ────────────────────────────────────────
+    # ── Key-value helpers (metadata, models, optimizers) ─────────────
 
-    def _atomic_write(self, filename: str, data: dict) -> None:
-        target = self._dir / filename
-        tmp = self._dir / f".{filename}.tmp"
-        tmp.write_text(json.dumps(data, indent=2))
-        os.replace(tmp, target)
+    def _kv_write(self, key: str, data: dict) -> None:
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO kv_store (key, value) VALUES (?, ?)",
+            (key, json.dumps(data)),
+        )
+        conn.commit()
 
-    def _atomic_read(self, filename: str) -> dict:
-        target = self._dir / filename
-        if not target.exists():
+    def _kv_read(self, key: str) -> dict:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT value FROM kv_store WHERE key = ?", (key,),
+        ).fetchone()
+        if row is None:
             return {}
         try:
-            return json.loads(target.read_text())
-        except (json.JSONDecodeError, OSError):
+            return json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
             return {}
 
-    # ── Generic JSONL helpers ─────────────────────────────────────────
+    # ── Event append / read ──────────────────────────────────────────
 
-    def _append_jsonl(self, filename: str, entries: list[dict]) -> None:
-        target = self._dir / filename
-        with open(target, "a") as f:
-            for entry in entries:
-                f.write(json.dumps(entry) + "\n")
-        cache = self._jsonl_cache.get(filename)
-        if cache is not None:
-            cache["entries"].extend(entries)
-            cache["offset"] = target.stat().st_size
-            cache["buffer"] = ""
-            cache["inode"] = target.stat().st_ino
+    def _append_events(self, channel: str, entries: list[dict]) -> None:
+        if not entries:
+            return
+        conn = self._get_conn()
+        rows = []
+        for entry in entries:
+            rows.append((
+                channel,
+                entry.get("step") or entry.get("_step"),
+                entry.get("model"),
+                entry.get("layer"),
+                entry.get("_timestamp"),
+                json.dumps(entry),
+            ))
+        conn.executemany(
+            "INSERT INTO events (channel, step, model, layer, timestamp, data) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        conn.commit()
 
-    def _read_jsonl(self, filename: str) -> list[dict]:
-        target = self._dir / filename
-        if not target.exists():
-            self._jsonl_cache.pop(filename, None)
-            return []
-        try:
-            stat = target.stat()
-        except OSError:
-            self._jsonl_cache.pop(filename, None)
-            return []
+    def _read_events(
+        self,
+        channel: str,
+        *,
+        step_min: int | None = None,
+        step_max: int | None = None,
+        model: str | None = None,
+        layer: str | None = None,
+        last_n: int | None = None,
+    ) -> list[dict]:
+        """Read events for *channel* with optional SQL-level filters.
 
-        cache = self._jsonl_cache.get(filename)
-        if cache is None or stat.st_size < cache["offset"] or stat.st_ino != cache["inode"]:
-            cache = {
-                "entries": [],
-                "offset": 0,
-                "buffer": "",
-                "inode": stat.st_ino,
-            }
-            self._jsonl_cache[filename] = cache
+        Parameters
+        ----------
+        step_min, step_max : int, optional
+            Inclusive step range.
+        model : str, optional
+            Filter to a single model name.
+        layer : str, optional
+            Filter to a single layer name.
+        last_n : int, optional
+            Return only the last *N* rows (by insertion order).
+        """
+        conn = self._get_conn()
+        clauses = ["channel = ?"]
+        params: list = [channel]
 
-        if stat.st_size == cache["offset"]:
-            return cache["entries"]
+        if step_min is not None:
+            clauses.append("step >= ?")
+            params.append(step_min)
+        if step_max is not None:
+            clauses.append("step <= ?")
+            params.append(step_max)
+        if model is not None:
+            clauses.append("model = ?")
+            params.append(model)
+        if layer is not None:
+            clauses.append("layer = ?")
+            params.append(layer)
 
-        try:
-            with open(target, "r") as f:
-                f.seek(cache["offset"])
-                chunk = f.read()
-        except OSError:
-            return cache["entries"]
+        where = " AND ".join(clauses)
 
-        text = cache["buffer"] + chunk
-        lines = text.splitlines(keepends=True)
-        remainder = ""
-        parsed: list[dict] = []
+        if last_n is not None:
+            # Sub-select to get last N rows, then re-order ascending.
+            sql = (
+                f"SELECT data FROM ("
+                f"  SELECT data, id FROM events WHERE {where} "
+                f"  ORDER BY id DESC LIMIT ?"
+                f") ORDER BY id ASC"
+            )
+            params.append(last_n)
+        else:
+            sql = f"SELECT data FROM events WHERE {where} ORDER BY id ASC"
 
-        for line in lines:
-            if not line.endswith("\n"):
-                remainder = line
-                continue
-            stripped = line.strip()
-            if not stripped:
-                continue
+        rows = conn.execute(sql, params).fetchall()
+        result = []
+        for (data_json,) in rows:
             try:
-                parsed.append(json.loads(stripped))
-            except json.JSONDecodeError:
+                result.append(json.loads(data_json))
+            except (json.JSONDecodeError, TypeError):
                 continue
+        return result
 
-        cache["entries"].extend(parsed)
-        cache["offset"] = stat.st_size
-        cache["buffer"] = remainder
-        cache["inode"] = stat.st_ino
-        return cache["entries"]
+    def _max_step(self, channel: str, *, model: str | None = None) -> int | None:
+        """Return the highest step value for *channel*, or None if empty."""
+        conn = self._get_conn()
+        if model is not None:
+            row = conn.execute(
+                "SELECT MAX(step) FROM events WHERE channel = ? AND model = ?",
+                (channel, model),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT MAX(step) FROM events WHERE channel = ?",
+                (channel,),
+            ).fetchone()
+        if row and row[0] is not None:
+            return int(row[0])
+        return None
 
-    # ── Metadata ──────────────────────────────────────────────────────
+    def _count_events(self, channel: str) -> int:
+        """Return total number of events in *channel*."""
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE channel = ?", (channel,),
+        ).fetchone()
+        return row[0] if row else 0
+
+    # ── Metadata ─────────────────────────────────────────────────────
 
     def write_metadata(self, metadata: dict) -> None:
-        self._atomic_write("metadata.json", metadata)
+        self._kv_write("metadata", metadata)
 
     def read_metadata(self) -> dict:
-        return self._atomic_read("metadata.json")
+        return self._kv_read("metadata")
 
-    # ── Models ────────────────────────────────────────────────────────
+    # ── Models ───────────────────────────────────────────────────────
 
     def write_models(self, models: dict[str, dict]) -> None:
-        self._atomic_write("models.json", models)
+        self._kv_write("models", models)
 
     def read_models(self) -> dict[str, dict]:
-        return self._atomic_read("models.json")
+        return self._kv_read("models")
 
-    # ── Optimizers ────────────────────────────────────────────────────
+    # ── Optimizers ───────────────────────────────────────────────────
 
     def write_optimizers(self, optimizers: dict[str, dict]) -> None:
-        self._atomic_write("optimizers.json", optimizers)
+        self._kv_write("optimizers", optimizers)
 
     def read_optimizers(self) -> dict[str, dict]:
-        return self._atomic_read("optimizers.json")
+        return self._kv_read("optimizers")
 
-    # ── Metrics (wandb scalars) ───────────────────────────────────────
+    # ── Metrics (wandb scalars) ──────────────────────────────────────
 
     def append_metrics(self, entry: dict) -> None:
-        self._append_jsonl("metrics.jsonl", [entry])
+        self._append_events("metrics", [entry])
 
-    def read_metrics(self) -> list[dict]:
-        return self._read_jsonl("metrics.jsonl")
+    def read_metrics(
+        self,
+        *,
+        step_min: int | None = None,
+        step_max: int | None = None,
+        last_n: int | None = None,
+    ) -> list[dict]:
+        return self._read_events(
+            "metrics", step_min=step_min, step_max=step_max, last_n=last_n,
+        )
 
-    # ── Gradient stats ────────────────────────────────────────────────
+    # ── Gradient stats ───────────────────────────────────────────────
 
     def append_gradient_stats(self, entries: list[dict]) -> None:
-        self._append_jsonl("gradient_stats.jsonl", entries)
+        self._append_events("gradient_stats", entries)
 
-    def read_gradient_stats(self) -> list[dict]:
-        return self._read_jsonl("gradient_stats.jsonl")
+    def read_gradient_stats(
+        self,
+        *,
+        step_min: int | None = None,
+        step_max: int | None = None,
+        model: str | None = None,
+        layer: str | None = None,
+        last_n: int | None = None,
+    ) -> list[dict]:
+        return self._read_events(
+            "gradient_stats",
+            step_min=step_min, step_max=step_max,
+            model=model, layer=layer, last_n=last_n,
+        )
 
-    # ── Weight stats ──────────────────────────────────────────────────
+    # ── Weight stats ─────────────────────────────────────────────────
 
     def append_weight_stats(self, entries: list[dict]) -> None:
-        self._append_jsonl("weight_stats.jsonl", entries)
+        self._append_events("weight_stats", entries)
 
-    def read_weight_stats(self) -> list[dict]:
-        return self._read_jsonl("weight_stats.jsonl")
+    def read_weight_stats(
+        self,
+        *,
+        step_min: int | None = None,
+        step_max: int | None = None,
+        model: str | None = None,
+        layer: str | None = None,
+        last_n: int | None = None,
+    ) -> list[dict]:
+        return self._read_events(
+            "weight_stats",
+            step_min=step_min, step_max=step_max,
+            model=model, layer=layer, last_n=last_n,
+        )
 
-    # ── Activation stats ──────────────────────────────────────────────
+    # ── Activation stats ─────────────────────────────────────────────
 
     def append_activation_stats(self, entries: list[dict]) -> None:
-        self._append_jsonl("activation_stats.jsonl", entries)
+        self._append_events("activation_stats", entries)
 
-    def read_activation_stats(self) -> list[dict]:
-        return self._read_jsonl("activation_stats.jsonl")
+    def read_activation_stats(
+        self,
+        *,
+        step_min: int | None = None,
+        step_max: int | None = None,
+        model: str | None = None,
+        layer: str | None = None,
+        last_n: int | None = None,
+    ) -> list[dict]:
+        return self._read_events(
+            "activation_stats",
+            step_min=step_min, step_max=step_max,
+            model=model, layer=layer, last_n=last_n,
+        )
 
-    # ── Predictions (value calibration) ───────────────────────────────
+    # ── Predictions (value calibration) ──────────────────────────────
 
     def append_predictions(self, entries: list[dict]) -> None:
-        self._append_jsonl("predictions.jsonl", entries)
+        self._append_events("predictions", entries)
 
-    def read_predictions(self) -> list[dict]:
-        return self._read_jsonl("predictions.jsonl")
+    def read_predictions(
+        self,
+        *,
+        step_min: int | None = None,
+        step_max: int | None = None,
+        last_n: int | None = None,
+    ) -> list[dict]:
+        return self._read_events(
+            "predictions", step_min=step_min, step_max=step_max, last_n=last_n,
+        )
 
-    # ── Attention patterns ────────────────────────────────────────────
+    # ── Attention patterns ───────────────────────────────────────────
 
     def append_attention(self, entries: list[dict]) -> None:
-        self._append_jsonl("attention.jsonl", entries)
+        self._append_events("attention", entries)
 
-    def read_attention(self) -> list[dict]:
-        return self._read_jsonl("attention.jsonl")
+    def read_attention(
+        self,
+        *,
+        step_min: int | None = None,
+        step_max: int | None = None,
+        last_n: int | None = None,
+    ) -> list[dict]:
+        return self._read_events(
+            "attention", step_min=step_min, step_max=step_max, last_n=last_n,
+        )
 
     # ── Optimizer state stats ────────────────────────────────────────
 
     def append_optimizer_state(self, entries: list[dict]) -> None:
-        self._append_jsonl("optimizer_state.jsonl", entries)
+        self._append_events("optimizer_state", entries)
 
-    def read_optimizer_state(self) -> list[dict]:
-        return self._read_jsonl("optimizer_state.jsonl")
+    def read_optimizer_state(
+        self,
+        *,
+        step_min: int | None = None,
+        step_max: int | None = None,
+        last_n: int | None = None,
+    ) -> list[dict]:
+        return self._read_events(
+            "optimizer_state", step_min=step_min, step_max=step_max, last_n=last_n,
+        )
 
     # ── On-demand requests / responses ───────────────────────────────
 
     def write_request(self, request: dict) -> None:
         """Queue a computation request for the training process."""
-        self._append_jsonl("_requests.jsonl", [request])
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT INTO requests (data) VALUES (?)",
+            (json.dumps(request),),
+        )
+        conn.commit()
 
     def read_requests(self) -> list[dict]:
         """Read all pending requests."""
-        return self._read_jsonl("_requests.jsonl")
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT data FROM requests ORDER BY id ASC",
+        ).fetchall()
+        result = []
+        for (data_json,) in rows:
+            try:
+                result.append(json.loads(data_json))
+            except (json.JSONDecodeError, TypeError):
+                continue
+        return result
 
     def clear_requests(self) -> None:
-        """Remove the request file (called by training process after processing)."""
-        target = self._dir / "_requests.jsonl"
-        if target.exists():
-            target.unlink()
-        self._jsonl_cache.pop("_requests.jsonl", None)
+        """Remove all pending requests."""
+        conn = self._get_conn()
+        conn.execute("DELETE FROM requests")
+        conn.commit()
 
     def write_response(self, request_id: str, data: dict) -> None:
         """Write a computation response."""
-        resp_dir = self._dir / "_responses"
-        resp_dir.mkdir(exist_ok=True)
-        target = resp_dir / f"{request_id}.json"
-        tmp = resp_dir / f".{request_id}.json.tmp"
-        tmp.write_text(json.dumps(data))
-        os.replace(tmp, target)
+        conn = self._get_conn()
+        conn.execute(
+            "INSERT OR REPLACE INTO responses (request_id, data) VALUES (?, ?)",
+            (request_id, json.dumps(data)),
+        )
+        conn.commit()
 
     def read_response(self, request_id: str) -> dict | None:
         """Read a response if available.  Returns None if not yet computed."""
-        target = self._dir / "_responses" / f"{request_id}.json"
-        if not target.exists():
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT data FROM responses WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        if row is None:
             return None
         try:
-            return json.loads(target.read_text())
-        except (json.JSONDecodeError, OSError):
+            return json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
             return None
 
     def clear_response(self, request_id: str) -> None:
-        target = self._dir / "_responses" / f"{request_id}.json"
-        if target.exists():
-            target.unlink()
+        conn = self._get_conn()
+        conn.execute(
+            "DELETE FROM responses WHERE request_id = ?",
+            (request_id,),
+        )
+        conn.commit()
 
-    # ── Cleanup ───────────────────────────────────────────────────────
+    # ── Cleanup ──────────────────────────────────────────────────────
 
     def cleanup(self) -> None:
-        self._jsonl_cache.clear()
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
         if self._owns_dir and self._dir.exists():
             shutil.rmtree(self._dir, ignore_errors=True)

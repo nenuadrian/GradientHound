@@ -820,8 +820,8 @@ def create_app(
                 "Pass --data-dir to load live gradient captures.",
             )
 
-        entries = ipc.read_gradient_stats()
-        if not entries:
+        # Quick count check avoids loading all rows when empty.
+        if ipc._count_events("gradient_stats") == 0:
             model_options = [
                 {"label": name, "value": name}
                 for name in sorted(ipc.read_models().keys())
@@ -834,20 +834,22 @@ def create_app(
                 "No gradient records yet.",
             )
 
-        model_names = sorted({e.get("model", "") for e in entries if e.get("model")})
+        # Discover model names from the kv store (fast) rather than
+        # scanning all events.
+        model_names = sorted(ipc.read_models().keys())
         if not model_names:
-            model_names = sorted(ipc.read_models().keys())
+            # Fallback: read a small sample to extract model names.
+            sample = ipc.read_gradient_stats(last_n=200)
+            model_names = sorted({e.get("model", "") for e in sample if e.get("model")})
         model_options = [{"label": name, "value": name} for name in model_names]
 
         if selected_model not in model_names:
             selected_model = model_names[0] if model_names else None
 
-        if selected_model:
-            model_entries = [e for e in entries if e.get("model") == selected_model]
-        else:
-            model_entries = entries
-
-        if not model_entries:
+        # Use SQL-level filtering: find latest step for this model,
+        # then fetch only the step window we need.
+        latest_step = ipc._max_step("gradient_stats", model=selected_model)
+        if latest_step is None:
             return (
                 _empty_gradflow_figure("No records for the selected model."),
                 model_options,
@@ -855,13 +857,11 @@ def create_app(
                 "No gradient records for this model.",
             )
 
-        latest_step = max(int(e.get("step", 0)) for e in model_entries)
         window_steps = int(window_steps or 10)
         min_step = max(0, latest_step - window_steps + 1)
-        window_entries = [
-            e for e in model_entries
-            if min_step <= int(e.get("step", 0)) <= latest_step
-        ]
+        window_entries = ipc.read_gradient_stats(
+            model=selected_model, step_min=min_step, step_max=latest_step,
+        )
 
         hide_bias = "hide_bias" in (hide_bias_opts or [])
         layer_stats: dict[str, dict[str, float]] = {}
@@ -1915,14 +1915,11 @@ def create_app(
         if reader is None:
             return "", f"Unknown data type: {data_type}"
 
-        entries = reader()
-        total = len(entries)
+        limit = int(limit or 50)
+        total = ipc._count_events(data_type)
+        entries = reader(last_n=limit) if limit > 0 else reader()
         if not entries:
             return dbc.Alert("No records found.", color="secondary"), f"0 records"
-
-        limit = int(limit or 50)
-        if limit > 0:
-            entries = entries[-limit:]
 
         # Auto-detect columns from first few entries
         all_keys: list[str] = []
