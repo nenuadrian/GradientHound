@@ -34,6 +34,7 @@ pip install gradienthound[torch]     # + PyTorch hooks
 pip install gradienthound[dash]      # + standalone dashboard (Dash, Plotly, Cytoscape, wandb)
 pip install gradienthound[spectral]  # + WeightWatcher-style spectral metrics (powerlaw)
 pip install gradienthound[analysis]  # + FLOPs/pruning analysis (fvcore, torch-pruning)
+pip install gradienthound[embeddings] # + t-SNE, UMAP, PCA layer embeddings (scikit-learn, umap-learn)
 ```
 
 ---
@@ -126,6 +127,10 @@ Gradient norm evolution across layers over training steps, cosine similarity bet
 ### Metrics
 
 Time-series charts for scalars logged via wandb or directly.
+
+### Embeddings
+
+t-SNE, UMAP, and PCA projections of per-layer weight statistics. Each layer becomes a point in 2D; proximity means similar weight characteristics (norm, kurtosis, effective rank, etc.). With multiple checkpoints, arrows trace each layer's trajectory through training. Controls for method, perplexity/neighbors, and coloring by checkpoint, layer type, or depth. PCA works with no extra dependencies; t-SNE requires `scikit-learn`, UMAP requires `umap-learn`.
 
 ### Tools
 

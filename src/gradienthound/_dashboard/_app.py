@@ -25,6 +25,7 @@ from ._wandb import parse_wandb_project_run_id, fetch_wandb_run_metrics, metrics
 from ._pages import (
     overview_page, landing_page_empty, architecture_page,
     weight_health_page, distributions_page, spectral_page, dynamics_page,
+    embeddings_page,
     gradient_flow_page,
     checkpoints_page, checkpoints_page_empty,
     tools_page,
@@ -766,6 +767,9 @@ def create_app(
 
         if pathname == "/dynamics":
             return dynamics_page(current_model_data, snapshots=snapshots)
+
+        if pathname == "/embeddings":
+            return embeddings_page(current_model_data, snapshots=snapshots)
 
         # ── LIVE ─────────────────────────────────────────────────────
         if pathname == "/gradient-flow":
@@ -1590,5 +1594,35 @@ def create_app(
             sections.append(html.H4(cat_label, className="mt-4 mb-3"))
             sections.append(dbc.Row([_tool_card(t) for t in categories[cat]]))
         return sections
+
+    # ── Embeddings page callback ────────────────────────────────────
+
+    @callback(
+        Output("embed-chart-wrap", "children"),
+        Input("embed-method", "value"),
+        Input("embed-perplexity", "value"),
+        Input("embed-color-by", "value"),
+        prevent_initial_call=True,
+    )
+    def _update_embedding(method, perplexity, color_by):
+        from ._page_embeddings import _build_embedding_chart
+        snapshots = ckpt_state["snapshots"] if ckpt_state["processed"] else None
+        if not snapshots:
+            return dbc.Alert("No checkpoints loaded.", color="info")
+        fig = _build_embedding_chart(
+            snapshots,
+            method=method or "pca",
+            perplexity=float(perplexity or 8),
+            color_by=color_by or "checkpoint",
+        )
+        if fig is None:
+            return dbc.Alert(
+                "Not enough layers with complete statistics for embedding.",
+                color="warning",
+            )
+        return dbc.Card(
+            dbc.CardBody(dcc.Graph(figure=fig, id="embed-scatter")),
+            className="mb-3",
+        )
 
     return app

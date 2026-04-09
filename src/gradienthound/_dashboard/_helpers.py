@@ -785,3 +785,142 @@ def render_checkpoint_change_table(
         ], bordered=True, hover=True, responsive=True, size="sm"),
         style={"maxHeight": "500px", "overflowY": "auto"},
     )
+
+
+# ── t-SNE / PCA embedding helpers ──────────────────────────────────────
+
+# Feature keys used to build the per-layer feature vector for embeddings.
+_EMBED_FEATURE_KEYS = [
+    "norm_l2", "norm_frobenius", "mean", "std", "min", "max",
+    "near_zero_pct", "kurtosis", "weight_entropy",
+    "effective_rank", "stable_rank", "condition_number",
+]
+
+
+def _extract_layer_features(
+    weight_stats: list[dict],
+    feature_keys: list[str] | None = None,
+) -> tuple[list[str], list[list[float]]]:
+    """Extract a numeric feature matrix from weight_stats entries.
+
+    Returns ``(layer_names, feature_rows)`` where each row is a float list
+    aligned to *feature_keys*.  Layers with any missing feature are skipped.
+    """
+    keys = feature_keys or _EMBED_FEATURE_KEYS
+    names: list[str] = []
+    rows: list[list[float]] = []
+    for entry in weight_stats:
+        row: list[float] = []
+        skip = False
+        for k in keys:
+            v = entry.get(k)
+            if v is None:
+                skip = True
+                break
+            row.append(float(v))
+        if skip:
+            continue
+        names.append(entry.get("layer", "?"))
+        rows.append(row)
+    return names, rows
+
+
+def compute_layer_embeddings(
+    snapshots: list[dict],
+    *,
+    method: str = "tsne",
+    perplexity: float = 8.0,
+    feature_keys: list[str] | None = None,
+) -> list[dict] | None:
+    """Compute 2D embeddings of layers from checkpoint weight stats.
+
+    Each layer in each snapshot becomes a point.  The feature vector is built
+    from the scalar statistics already stored in ``weight_stats``.
+
+    Args:
+        snapshots: List of snapshot dicts (must have ``weight_stats``).
+        method: ``"tsne"``, ``"umap"``, or ``"pca"``.
+        perplexity: t-SNE perplexity (clamped to valid range automatically).
+            Also used as ``n_neighbors`` for UMAP.
+        feature_keys: Override which stat keys form the feature vector.
+
+    Returns:
+        A list of dicts ``{layer, checkpoint, x, y}`` or ``None`` on failure.
+    """
+    import math
+
+    all_names: list[str] = []
+    all_ckpts: list[str] = []
+    all_rows: list[list[float]] = []
+
+    for snap in snapshots:
+        ckpt_name = snap.get("name", "?")
+        names, rows = _extract_layer_features(
+            snap.get("weight_stats", []),
+            feature_keys=feature_keys,
+        )
+        all_names.extend(names)
+        all_ckpts.extend([ckpt_name] * len(names))
+        all_rows.extend(rows)
+
+    if len(all_rows) < 4:
+        return None
+
+    # Standardise features (zero-mean, unit-variance)
+    import numpy as np  # numpy is available via plotly/dash deps
+
+    X = np.array(all_rows, dtype=np.float64)
+    mu = X.mean(axis=0)
+    sigma = X.std(axis=0)
+    sigma[sigma < 1e-12] = 1.0
+    X = (X - mu) / sigma
+
+    if method == "tsne":
+        try:
+            from sklearn.manifold import TSNE
+
+            effective_perp = min(perplexity, max(1.0, (len(X) - 1) / 3.0))
+            reducer = TSNE(
+                n_components=2,
+                perplexity=effective_perp,
+                random_state=42,
+                init="pca",
+                learning_rate="auto",
+            )
+            coords = reducer.fit_transform(X)
+        except ImportError:
+            method = "pca"
+
+    if method == "umap":
+        try:
+            from umap import UMAP
+
+            n_neighbors = max(2, min(int(perplexity), len(X) - 1))
+            reducer = UMAP(
+                n_components=2,
+                n_neighbors=n_neighbors,
+                min_dist=0.1,
+                random_state=42,
+            )
+            coords = reducer.fit_transform(X)
+        except ImportError:
+            method = "pca"
+
+    if method == "pca":
+        # Simple PCA via SVD — no sklearn needed
+        X_centered = X - X.mean(axis=0)
+        try:
+            U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+            coords = U[:, :2] * S[:2]
+        except np.linalg.LinAlgError:
+            return None
+
+    results: list[dict] = []
+    for i in range(len(all_names)):
+        results.append({
+            "layer": all_names[i],
+            "checkpoint": all_ckpts[i],
+            "x": float(coords[i, 0]),
+            "y": float(coords[i, 1]),
+        })
+    return results

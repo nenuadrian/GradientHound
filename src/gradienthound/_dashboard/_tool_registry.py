@@ -145,6 +145,21 @@ def register_builtin_tools(
         page="/spectral",
     ))
 
+    registry.register(ToolInfo(
+        id="tsne_embeddings",
+        name="t-SNE / PCA Embeddings",
+        description="Project per-layer weight statistics into 2D using t-SNE "
+                    "or PCA. Visualises layer clustering and training trajectories.",
+        category="analysis",
+        requires=[
+            Requirement("Checkpoint paths provided", lambda: has_checkpoints),
+        ],
+        check_has_data=lambda: (
+            ckpt_state is not None and ckpt_state.get("processed", False)
+        ),
+        page="/embeddings",
+    ))
+
     # ── Integration tools ──────────────────────────────────────────
 
     registry.register(ToolInfo(

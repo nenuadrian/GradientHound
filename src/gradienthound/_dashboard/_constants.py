@@ -29,6 +29,7 @@ PAGES = {
     "/distributions":  ("Distributions",      "Histograms, statistics, kurtosis, entropy"),
     "/spectral":       ("Spectral",           "Effective rank, SVD, ESD, WeightWatcher"),
     "/dynamics":       ("Training Dynamics",  "Norm change, drift, velocity, convergence"),
+    "/embeddings":     ("Embeddings",         "t-SNE / PCA projections of layer stats"),
     "/gradient-flow":  ("Gradient Flow",      "Gradient magnitudes across layers"),
     "/metrics":        ("Metrics",            "Run metrics from Weights & Biases"),
     "/checkpoints":    ("Checkpoints",        "Compare model checkpoints"),
@@ -37,7 +38,7 @@ PAGES = {
 
 PAGE_CATEGORIES = {
     "MODEL":    ["/", "/architecture"],
-    "ANALYSIS": ["/weight-health", "/distributions", "/spectral", "/dynamics"],
+    "ANALYSIS": ["/weight-health", "/distributions", "/spectral", "/dynamics", "/embeddings"],
     "LIVE":     ["/gradient-flow", "/metrics"],
     "DATA":     ["/checkpoints"],
     "SYSTEM":   ["/tools"],
