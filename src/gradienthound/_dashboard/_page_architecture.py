@@ -264,6 +264,29 @@ def architecture_page(model_data: dict, snapshots: list | None = None):
         html.P("Model structure, computation graph, and resource analysis.", className="text-muted mb-4"),
     ]
 
+    # ── PyTorch model repr ──────────────────────────────────────────
+    pytorch_repr = mt.get("pytorch_repr", "")
+    if pytorch_repr:
+        children.append(dbc.Card(dbc.CardBody([
+            html.H5("Model Summary", className="card-title"),
+            html.P("Textual representation of the model (equivalent to print(model) in PyTorch).",
+                    className="text-muted"),
+            html.Pre(
+                pytorch_repr,
+                style={
+                    "backgroundColor": "#1a1a2e",
+                    "color": "#e0e0e0",
+                    "padding": "16px",
+                    "borderRadius": "6px",
+                    "fontSize": "0.82em",
+                    "maxHeight": "500px",
+                    "overflowY": "auto",
+                    "whiteSpace": "pre",
+                    "fontFamily": "SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+                },
+            ),
+        ]), className="mb-3"))
+
     # ── Live analysis sections (FLOPs, activations, pruning) ─────────
     children.extend(_build_live_analysis_sections(live, model_data))
 
