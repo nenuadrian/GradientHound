@@ -14,10 +14,6 @@ def main() -> None:
         help="Port to serve the dashboard on (default: 8050)",
     )
     parser.add_argument(
-        "--data-dir", type=str, default=None,
-        help="Path to an IPC data directory to load",
-    )
-    parser.add_argument(
         "--model", type=str, default=None,
         help="Path to a .gh.json model export file or folder to recursively search for model exports",
     )
@@ -60,7 +56,6 @@ def main() -> None:
         model_paths = discover_model_exports([args.model])
 
     app = create_app(
-        data_dir=args.data_dir,
         model_paths=model_paths,
         checkpoint_paths=checkpoint_paths,
         loader_path=args.loader,

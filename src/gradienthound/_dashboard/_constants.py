@@ -32,8 +32,6 @@ PAGES = {
     "/gradient-flow":  ("Gradient Flow",      "Gradient magnitudes across layers"),
     "/metrics":        ("Metrics",            "Run metrics from Weights & Biases"),
     "/checkpoints":    ("Checkpoints",        "Compare model checkpoints"),
-    "/on-demand":      ("On-Demand",          "Weight heatmaps, CKA similarity"),
-    "/raw-data":       ("Raw Data",           "Browse raw captured IPC data"),
     "/tools":          ("Tools",              "Registered tools and their status"),
 }
 
@@ -41,7 +39,7 @@ PAGE_CATEGORIES = {
     "MODEL":    ["/", "/architecture"],
     "ANALYSIS": ["/weight-health", "/distributions", "/spectral", "/dynamics"],
     "LIVE":     ["/gradient-flow", "/metrics"],
-    "DATA":     ["/checkpoints", "/on-demand", "/raw-data"],
+    "DATA":     ["/checkpoints"],
     "SYSTEM":   ["/tools"],
 }
 

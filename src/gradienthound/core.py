@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Any
 
 from .graph import extract_model_graph
 from .hooks import WatchState
-from .ipc import IPCChannel
 
 if TYPE_CHECKING:
     import torch
@@ -27,13 +26,10 @@ class GradientHound:
         self._optimizer_refs: dict[str, optim.Optimizer] = {}
         self._watches: dict[str, WatchState] = {}
         self._metadata: dict = metadata or {}
-        self._ipc = IPCChannel()
         self._wandb_original_log: Any = None
         self._step: int = 0
         self._last_flushed_step: int | None = None
         self._shutdown_called: bool = False
-
-        self._ipc.write_metadata(self._metadata)
 
         atexit.register(self.shutdown)
 
@@ -41,14 +37,12 @@ class GradientHound:
         """Register a PyTorch model. The UI will display its architecture."""
         graph = extract_model_graph(name, model)
         self._models[name] = graph
-        self._ipc.write_models(self._models)
 
     def register_optimizer(self, name: str, optimizer: optim.Optimizer) -> None:
         """Register an optimizer. The UI will display its configuration."""
         info = _extract_optimizer_info(optimizer)
         self._optimizers[name] = info
         self._optimizer_refs[name] = optimizer
-        self._ipc.write_optimizers(self._optimizers)
 
     # ── Hook-based capture ──────────────────────────────────────────
 
@@ -93,7 +87,7 @@ class GradientHound:
         return self._step
 
     def step(self, step: int | None = None) -> None:
-        """Flush buffered stats to IPC at the current or supplied training step."""
+        """Advance the step counter and flush buffered stats."""
         current_step = self._sync_step(step, advance=step is None)
         has_pending_buffers = any(
             ws._grad_buffer or ws._activation_buffer  # noqa: SLF001
@@ -102,70 +96,20 @@ class GradientHound:
         should_emit_weights = self._last_flushed_step != current_step
 
         if self._last_flushed_step == current_step and not has_pending_buffers:
-            self._process_requests()
             return
 
         for ws in self._watches.values():
-            ws.flush_gradient_stats(current_step, self._ipc)
-            ws.flush_activation_stats(current_step, self._ipc)
+            ws.flush_gradient_stats(current_step)
+            ws.flush_activation_stats(current_step)
             if should_emit_weights and current_step % ws.weight_every == 0:
-                ws.compute_weight_stats(current_step, self._ipc)
-                self._flush_optimizer_state()
+                ws.compute_weight_stats(current_step)
         self._last_flushed_step = current_step
-        # Process on-demand requests once per step, routing each request
-        # to the correct WatchState by model name.
-        self._process_requests()
-
-    def _process_requests(self) -> None:
-        """Read pending on-demand requests and route each to the right WatchState.
-
-        Reads the request queue *once* per ``step()`` so that requests are
-        never silently dropped when multiple WatchStates exist.
-        """
-        requests = self._ipc.read_requests()
-        if not requests:
-            return
-        self._ipc.clear_requests()
-
-        for req in requests:
-            model_name = req.get("model")
-            req_type = req.get("type")
-            req_id = req.get("id", req_type)
-
-            # Route to the matching WatchState, or fall back to the first one
-            ws = self._watches.get(model_name) if model_name else None
-            if ws is None and self._watches:
-                ws = next(iter(self._watches.values()))
-            if ws is None:
-                self._ipc.write_response(
-                    req_id, {"error": "no watched model available"})
-                continue
-
-            try:
-                if req_type == "weight_heatmap":
-                    ws._compute_weight_heatmap(req, self._step, req_id, self._ipc)
-                elif req_type == "cka":
-                    ws._compute_cka(self._step, req_id, self._ipc)
-                elif req_type == "network_state":
-                    ws._compute_network_state(self._step, req_id, self._ipc)
-            except Exception:
-                self._ipc.write_response(req_id, {"error": "computation failed"})
-
-    def _flush_optimizer_state(self) -> None:
-        """Extract live optimizer state statistics and write to IPC."""
-        entries = []
-        for name, optimizer in self._optimizer_refs.items():
-            entry = _extract_optimizer_state_stats(optimizer, self._step, name)
-            if entry:
-                entries.append(entry)
-        if entries:
-            self._ipc.append_optimizer_state(entries)
 
     def log_weights(self, name: str | None = None) -> None:
         """Force an immediate weight snapshot."""
         targets = [self._watches[name]] if name else list(self._watches.values())
         for ws in targets:
-            ws.compute_weight_stats(self._step, self._ipc)
+            ws.compute_weight_stats(self._step)
 
     def log_attention(
         self,
@@ -191,15 +135,6 @@ class GradientHound:
         if sq > max_seq or skv > max_seq:
             w = F.adaptive_avg_pool2d(w.unsqueeze(0), (min(sq, max_seq), min(skv, max_seq))).squeeze(0)
 
-        self._ipc.append_attention([{
-            "step": self._step,
-            "name": name,
-            "heads": heads,
-            "shape": [heads, sq, skv],
-            "weights": w.tolist(),
-            "_timestamp": time.time(),
-        }])
-
     def log_predictions(
         self,
         predicted: Any,
@@ -223,14 +158,6 @@ class GradientHound:
             stride = len(pred) // 500
             pred = pred[::stride]
             act = act[::stride]
-
-        self._ipc.append_predictions([{
-            "step": self._step,
-            "name": name,
-            "predicted": pred,
-            "actual": act,
-            "_timestamp": time.time(),
-        }])
 
     # ── Wandb capture ─────────────────────────────────────────────────
 
@@ -258,19 +185,8 @@ class GradientHound:
             logged_step = kwargs.get("step")
             if logged_step is not None:
                 self.step(step=logged_step)
-                entry_step = self._step
             else:
-                entry_step = self._step
                 self._step += 1
-
-            # Extract scalar values for our dashboard
-            entry: dict[str, Any] = {"_step": entry_step, "_timestamp": time.time()}
-            for k, v in data.items():
-                if isinstance(v, (int, float)):
-                    entry[k] = v
-
-            if len(entry) > 2:  # has more than just _step and _timestamp
-                self._ipc.append_metrics(entry)
 
             return result
 
@@ -287,7 +203,7 @@ class GradientHound:
             self._wandb_original_log = None
 
     def shutdown(self) -> None:
-        """Clean up hooks, wandb patching, and IPC resources.
+        """Clean up hooks and wandb patching.
 
         Idempotent -- safe to call more than once (e.g. from both a
         ``with`` block and the atexit handler).
@@ -305,11 +221,6 @@ class GradientHound:
             for ws in self._watches.values():
                 ws.remove_hooks()
             self._watches.clear()
-        except Exception:
-            pass
-
-        try:
-            self._ipc.cleanup()
         except Exception:
             pass
 
@@ -376,80 +287,3 @@ def _extract_optimizer_info(optimizer: optim.Optimizer) -> dict:
         "total_memory_bytes": total_memory,
         "buffers_per_param": buffers_per_param,
     }
-
-
-def _extract_optimizer_state_stats(
-    optimizer: optim.Optimizer, step: int, name: str,
-) -> dict | None:
-    """Extract per-group statistics from the live optimizer state buffers."""
-    import time as _time
-
-    state = optimizer.state
-    if not state:
-        return None
-
-    opt_type = type(optimizer).__name__
-    groups_stats = []
-
-    for i, group in enumerate(optimizer.param_groups):
-        exp_avg_norms: list[float] = []
-        exp_avg_sq_means: list[float] = []
-        momentum_norms: list[float] = []
-        adam_step: int = 0
-
-        for p in group["params"]:
-            if p not in state:
-                continue
-            s = state[p]
-
-            # Adam family
-            if "exp_avg" in s:
-                exp_avg_norms.append(s["exp_avg"].norm(2).item())
-            if "exp_avg_sq" in s:
-                exp_avg_sq_means.append(s["exp_avg_sq"].mean().item())
-            if "step" in s:
-                sv = s["step"]
-                adam_step = max(adam_step, int(sv.item()) if hasattr(sv, "item") else int(sv))
-
-            # SGD / RMSprop momentum
-            if "momentum_buffer" in s:
-                momentum_norms.append(s["momentum_buffer"].norm(2).item())
-
-        gs: dict = {"group_index": i, "lr": group.get("lr", 0)}
-
-        if exp_avg_norms:
-            gs["exp_avg_norm_mean"] = sum(exp_avg_norms) / len(exp_avg_norms)
-            gs["exp_avg_norm_max"] = max(exp_avg_norms)
-        if exp_avg_sq_means:
-            gs["exp_avg_sq_mean"] = sum(exp_avg_sq_means) / len(exp_avg_sq_means)
-            # Effective LR estimate: lr / (sqrt(avg second moment) + eps)
-            eps = group.get("eps", 1e-8)
-            avg_v = sum(exp_avg_sq_means) / len(exp_avg_sq_means)
-            gs["effective_lr"] = group.get("lr", 0) / (avg_v ** 0.5 + eps)
-        if momentum_norms:
-            gs["momentum_norm_mean"] = sum(momentum_norms) / len(momentum_norms)
-            gs["momentum_norm_max"] = max(momentum_norms)
-        if adam_step > 0:
-            gs["optimizer_step"] = adam_step
-            # Warmup progress: bias correction factor converges as step grows
-            betas = group.get("betas", (0.9, 0.999))
-            if isinstance(betas, (list, tuple)) and len(betas) == 2:
-                beta2 = betas[1]
-                # Bias correction factor for variance: 1 - beta2^step
-                bias_correction = 1 - beta2 ** adam_step
-                gs["bias_correction2"] = bias_correction
-                # ~99% corrected at step = log(0.01)/log(beta2)
-                import math
-                steps_to_converge = math.log(0.01) / math.log(beta2) if beta2 < 1 else 1000
-                gs["warmup_pct"] = min(100.0, round(adam_step / steps_to_converge * 100, 1))
-
-        groups_stats.append(gs)
-
-    return {
-        "step": step,
-        "optimizer": name,
-        "type": opt_type,
-        "groups": groups_stats,
-        "_timestamp": _time.time(),
-    }
-

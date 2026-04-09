@@ -27,7 +27,7 @@ from ._pages import (
     weight_health_page, distributions_page, spectral_page, dynamics_page,
     gradient_flow_page,
     checkpoints_page, checkpoints_page_empty,
-    on_demand_page, raw_data_page, tools_page,
+    tools_page,
 )
 from ._tool_registry import ToolRegistry, ToolInfo, Requirement, register_builtin_tools
 
@@ -195,7 +195,6 @@ def _merge_model_exports(gh_files: list[Path]) -> dict:
 
 
 def create_app(
-    data_dir: str | None = None,
     model_paths: list[str] | None = None,
     checkpoint_paths: list[str] | None = None,
     loader_path: str | None = None,
@@ -234,12 +233,6 @@ def create_app(
             model_path = available_models[selected_model]
             with open(model_path) as f:
                 model_data = json.load(f)
-
-    # IPC channel
-    ipc = None
-    if data_dir:
-        from gradienthound.ipc import IPCChannel
-        ipc = IPCChannel(directory=data_dir)
 
     # Checkpoint state
     ckpt_state: dict = {
@@ -314,7 +307,6 @@ def create_app(
     tool_registry = ToolRegistry()
     register_builtin_tools(
         tool_registry,
-        ipc=ipc,
         has_checkpoints=has_checkpoints,
         ckpt_state=ckpt_state,
         wandb_state=wandb_state,
@@ -777,10 +769,7 @@ def create_app(
 
         # ── LIVE ─────────────────────────────────────────────────────
         if pathname == "/gradient-flow":
-            model_names = []
-            if ipc is not None:
-                model_names = sorted(ipc.read_models().keys())
-            return gradient_flow_page(model_names=model_names)
+            return gradient_flow_page(model_names=[])
 
         if pathname == "/metrics":
             page_data = wandb_data if wandb_data is not None else wandb_state.get("data")
@@ -795,16 +784,6 @@ def create_app(
             if has_checkpoints:
                 return checkpoints_page(ckpt_state["paths"], snapshots)
             return checkpoints_page_empty()
-
-        if pathname == "/on-demand":
-            model_names = sorted(ipc.read_models().keys()) if ipc else []
-            return on_demand_page(model_names=model_names, has_ipc=ipc is not None)
-
-        if pathname == "/raw-data":
-            return raw_data_page(
-                has_ipc=ipc is not None,
-                data_dir=str(ipc.directory) if ipc else None,
-            )
 
         # ── SYSTEM ───────────────────────────────────────────────────
         if pathname == "/tools":
@@ -830,134 +809,12 @@ def create_app(
         prevent_initial_call=True,
     )
     def _update_gradient_flow(_n_intervals, selected_model, window_steps, hide_bias_opts):
-        import plotly.graph_objects as go
-
-        if ipc is None:
-            return (
-                _empty_gradflow_figure("No IPC data directory configured."),
-                [],
-                None,
-                "Pass --data-dir to load live gradient captures.",
-            )
-
-        # Quick count check avoids loading all rows when empty.
-        if ipc._count_events("gradient_stats") == 0:
-            model_options = [
-                {"label": name, "value": name}
-                for name in sorted(ipc.read_models().keys())
-            ]
-            model_value = selected_model or (model_options[0]["value"] if model_options else None)
-            return (
-                _empty_gradflow_figure("Waiting for gradient stats... call gradienthound.step() during training."),
-                model_options,
-                model_value,
-                "No gradient records yet.",
-            )
-
-        # Discover model names from the kv store (fast) rather than
-        # scanning all events.
-        model_names = sorted(ipc.read_models().keys())
-        if not model_names:
-            # Fallback: read a small sample to extract model names.
-            sample = ipc.read_gradient_stats(last_n=200)
-            model_names = sorted({e.get("model", "") for e in sample if e.get("model")})
-        model_options = [{"label": name, "value": name} for name in model_names]
-
-        if selected_model not in model_names:
-            selected_model = model_names[0] if model_names else None
-
-        # Use SQL-level filtering: find latest step for this model,
-        # then fetch only the step window we need.
-        latest_step = ipc._max_step("gradient_stats", model=selected_model)
-        if latest_step is None:
-            return (
-                _empty_gradflow_figure("No records for the selected model."),
-                model_options,
-                selected_model,
-                "No gradient records for this model.",
-            )
-
-        window_steps = int(window_steps or 10)
-        min_step = max(0, latest_step - window_steps + 1)
-        window_entries = ipc.read_gradient_stats(
-            model=selected_model, step_min=min_step, step_max=latest_step,
+        return (
+            _empty_gradflow_figure("Live gradient capture is not available. Use wandb for metrics."),
+            [],
+            None,
+            "Live gradient capture requires an IPC channel (not currently enabled).",
         )
-
-        hide_bias = "hide_bias" in (hide_bias_opts or [])
-        layer_stats: dict[str, dict[str, float]] = {}
-        layer_order: list[str] = []
-
-        for rec in window_entries:
-            layer = str(rec.get("layer", ""))
-            if not layer:
-                continue
-            if hide_bias and layer.endswith(".bias"):
-                continue
-
-            avg_grad = rec.get("grad_abs_mean")
-            if avg_grad is None:
-                avg_grad = abs(float(rec.get("grad_mean", 0.0)))
-
-            max_grad = rec.get("grad_abs_max")
-            if max_grad is None:
-                max_grad = abs(float(rec.get("grad_mean", 0.0))) + float(rec.get("grad_std", 0.0))
-
-            if layer not in layer_stats:
-                layer_stats[layer] = {
-                    "avg_sum": 0.0,
-                    "avg_count": 0.0,
-                    "max_val": 0.0,
-                }
-                layer_order.append(layer)
-
-            layer_stats[layer]["avg_sum"] += float(avg_grad)
-            layer_stats[layer]["avg_count"] += 1.0
-            layer_stats[layer]["max_val"] = max(layer_stats[layer]["max_val"], float(max_grad))
-
-        if not layer_order:
-            return (
-                _empty_gradflow_figure("No layers remain after applying filters."),
-                model_options,
-                selected_model,
-                "No plottable layers after filters.",
-            )
-
-        x_layers = [short_layer(layer) for layer in layer_order]
-        avg_vals = [layer_stats[layer]["avg_sum"] / max(layer_stats[layer]["avg_count"], 1.0) for layer in layer_order]
-        max_vals = [layer_stats[layer]["max_val"] for layer in layer_order]
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=x_layers,
-            y=max_vals,
-            name="max|grad|",
-            marker_color="#f39c12",
-            opacity=0.65,
-            hovertemplate="layer=%{x}<br>max|grad|=%{y:.6g}<extra></extra>",
-        ))
-        fig.add_trace(go.Bar(
-            x=x_layers,
-            y=avg_vals,
-            name="avg|grad|",
-            marker_color="#375a7f",
-            opacity=0.95,
-            hovertemplate="layer=%{x}<br>avg|grad|=%{y:.6g}<extra></extra>",
-        ))
-        fig.update_layout(
-            **plotly_layout(title="Gradient Flow Across Layers"),
-            barmode="overlay",
-            height=520,
-            xaxis_title="Layer",
-            yaxis_title="Gradient magnitude",
-            xaxis_tickangle=-45,
-            legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
-        )
-
-        summary = (
-            f"Model: {selected_model or 'all'} | Steps: {min_step}-{latest_step} | "
-            f"Layers: {len(layer_order)}"
-        )
-        return fig, model_options, selected_model, summary
 
     # ── Node click detail panels ─────────────────────────────────────
 
@@ -1707,365 +1564,6 @@ def create_app(
             ], bordered=True, hover=True, responsive=True, size="sm"),
             style={"maxHeight": "520px", "overflowY": "auto"},
         )
-
-    # ══════════════════════════════════════════════════════════════════
-    # ══════════════════════════════════════════════════════════════════
-    # ── On-Demand Analysis page callbacks ────────────────────────────
-    # ══════════════════════════════════════════════════════════════════
-
-    @callback(
-        Output("od-heatmap-layer", "options"),
-        Input("od-model-select", "value"),
-        prevent_initial_call=True,
-    )
-    def _update_od_layer_options(model_name):
-        if ipc is None:
-            return []
-        models = ipc.read_models()
-        model_info = models.get(model_name, {})
-        params = model_info.get("parameters", {})
-        options = []
-        for name, meta in params.items():
-            shape = meta.get("shape", [])
-            if len(shape) == 2:
-                shape_str = "x".join(str(s) for s in shape)
-                options.append({"label": f"{short_layer(name)} ({shape_str})", "value": name})
-        return options
-
-    # On-demand background task state
-    od_tasks: dict = {
-        "heatmap_req_id": None,
-        "heatmap_running": False,
-        "heatmap_result": None,
-        "cka_req_id": None,
-        "cka_running": False,
-        "cka_result": None,
-        "state_req_id": None,
-        "state_running": False,
-        "state_result": None,
-    }
-
-    def _od_poll_worker(req_id: str, task_key: str, ipc_channel, timeout: int = 20):
-        """Background thread that polls IPC for a response.
-
-        Receives ``ipc_channel`` as an explicit argument rather than
-        capturing it from the enclosing scope, so stale-reference bugs
-        are avoided if the surrounding state changes after the thread starts.
-        """
-        import time as _time
-        if ipc_channel is None:
-            od_tasks[f"{task_key}_result"] = {"error": "No IPC channel configured."}
-            od_tasks[f"{task_key}_running"] = False
-            return
-        for _ in range(timeout * 2):
-            try:
-                resp = ipc_channel.read_response(req_id)
-            except Exception as exc:
-                od_tasks[f"{task_key}_result"] = {"error": f"IPC read failed: {exc}"}
-                od_tasks[f"{task_key}_running"] = False
-                return
-            if resp is not None:
-                try:
-                    ipc_channel.clear_response(req_id)
-                except Exception:
-                    pass
-                od_tasks[f"{task_key}_result"] = resp
-                od_tasks[f"{task_key}_running"] = False
-                return
-            _time.sleep(0.5)
-        od_tasks[f"{task_key}_result"] = {"error": "Timeout: training process did not respond. Ensure gradienthound.step() is being called."}
-        od_tasks[f"{task_key}_running"] = False
-
-    # ── Heatmap: submit ──────────────────────────────────────────
-    @callback(
-        Output("od-heatmap-status", "children", allow_duplicate=True),
-        Output("od-heatmap-btn", "disabled"),
-        Output("od-poll", "disabled", allow_duplicate=True),
-        Input("od-heatmap-btn", "n_clicks"),
-        State("od-model-select", "value"),
-        State("od-heatmap-layer", "value"),
-        prevent_initial_call=True,
-    )
-    def _submit_heatmap(n_clicks, model_name, layer):
-        import uuid
-        if not n_clicks or ipc is None:
-            return no_update, no_update, no_update
-        if not layer:
-            return dbc.Alert("Select a layer first.", color="warning"), False, no_update
-
-        req_id = f"heatmap_{uuid.uuid4().hex[:8]}"
-        ipc.write_request({"type": "weight_heatmap", "id": req_id, "model": model_name, "layer": layer})
-        od_tasks["heatmap_req_id"] = req_id
-        od_tasks["heatmap_running"] = True
-        od_tasks["heatmap_result"] = None
-        threading.Thread(target=_od_poll_worker, args=(req_id, "heatmap", ipc, 20), daemon=True).start()
-        return (
-            [dbc.Spinner(size="sm", spinner_class_name="me-2"), "Computing\u2026"],
-            True,
-            False,  # enable polling
-        )
-
-    # ── CKA: submit ──────────────────────────────────────────────
-    @callback(
-        Output("od-cka-status", "children", allow_duplicate=True),
-        Output("od-cka-btn", "disabled"),
-        Output("od-poll", "disabled", allow_duplicate=True),
-        Input("od-cka-btn", "n_clicks"),
-        State("od-model-select", "value"),
-        prevent_initial_call=True,
-    )
-    def _submit_cka(n_clicks, model_name):
-        import uuid
-        if not n_clicks or ipc is None:
-            return no_update, no_update, no_update
-
-        req_id = f"cka_{uuid.uuid4().hex[:8]}"
-        ipc.write_request({"type": "cka", "id": req_id, "model": model_name})
-        od_tasks["cka_req_id"] = req_id
-        od_tasks["cka_running"] = True
-        od_tasks["cka_result"] = None
-        threading.Thread(target=_od_poll_worker, args=(req_id, "cka", ipc, 30), daemon=True).start()
-        return (
-            [dbc.Spinner(size="sm", spinner_class_name="me-2"), "Computing\u2026"],
-            True,
-            False,
-        )
-
-    # ── Network state: submit ────────────────────────────────────
-    @callback(
-        Output("od-state-status", "children", allow_duplicate=True),
-        Output("od-state-btn", "disabled"),
-        Output("od-poll", "disabled", allow_duplicate=True),
-        Input("od-state-btn", "n_clicks"),
-        State("od-model-select", "value"),
-        prevent_initial_call=True,
-    )
-    def _submit_network_state(n_clicks, model_name):
-        import uuid
-        if not n_clicks or ipc is None:
-            return no_update, no_update, no_update
-
-        req_id = f"state_{uuid.uuid4().hex[:8]}"
-        ipc.write_request({"type": "network_state", "id": req_id, "model": model_name})
-        od_tasks["state_req_id"] = req_id
-        od_tasks["state_running"] = True
-        od_tasks["state_result"] = None
-        threading.Thread(target=_od_poll_worker, args=(req_id, "state", ipc, 20), daemon=True).start()
-        return (
-            [dbc.Spinner(size="sm", spinner_class_name="me-2"), "Computing\u2026"],
-            True,
-            False,
-        )
-
-    # ── On-demand polling callback ───────────────────────────────
-    @callback(
-        Output("od-heatmap-chart", "figure"),
-        Output("od-heatmap-chart", "style"),
-        Output("od-heatmap-status", "children"),
-        Output("od-heatmap-btn", "disabled", allow_duplicate=True),
-        Output("od-cka-chart", "figure"),
-        Output("od-cka-chart", "style"),
-        Output("od-cka-status", "children"),
-        Output("od-cka-btn", "disabled", allow_duplicate=True),
-        Output("od-state-result", "children"),
-        Output("od-state-status", "children"),
-        Output("od-state-btn", "disabled", allow_duplicate=True),
-        Output("od-poll", "disabled"),
-        Input("od-poll", "n_intervals"),
-        prevent_initial_call=True,
-    )
-    def _poll_on_demand(_n):
-        import plotly.graph_objects as go
-
-        hm_fig, hm_style, hm_status, hm_btn = no_update, no_update, no_update, no_update
-        cka_fig, cka_style, cka_status, cka_btn = no_update, no_update, no_update, no_update
-        st_result, st_status, st_btn = no_update, no_update, no_update
-        any_running = od_tasks["heatmap_running"] or od_tasks["cka_running"] or od_tasks["state_running"]
-
-        # ── Heatmap result ──
-        if not od_tasks["heatmap_running"] and od_tasks["heatmap_result"] is not None:
-            resp = od_tasks["heatmap_result"]
-            od_tasks["heatmap_result"] = None
-            hm_btn = False
-            if "error" in resp:
-                hm_fig = go.Figure()
-                hm_style = {"display": "none"}
-                hm_status = dbc.Alert(resp["error"], color="danger")
-            else:
-                matrix = resp.get("matrix", [])
-                layer = resp.get("layer", "?")
-                fig = go.Figure(go.Heatmap(
-                    z=matrix, colorscale="RdBu_r", zmid=0,
-                    hovertemplate="row=%{y}<br>col=%{x}<br>value=%{z:.4g}<extra></extra>",
-                ))
-                shape = resp.get("shape", [])
-                disp = resp.get("display_shape", shape)
-                sparsity = resp.get("sparsity", 0)
-                fig.update_layout(
-                    **plotly_layout(
-                        title=f"{short_layer(layer)} "
-                              f"({'x'.join(str(s) for s in shape)}, "
-                              f"displayed {'x'.join(str(s) for s in disp)}) "
-                              f"| Sparsity: {sparsity:.1f}%"
-                    ),
-                    height=500, yaxis={"autorange": "reversed"},
-                )
-                hm_fig = fig
-                hm_style = {"display": "block"}
-                hm_status = dbc.Badge("Done", color="success")
-
-        # ── CKA result ──
-        if not od_tasks["cka_running"] and od_tasks["cka_result"] is not None:
-            resp = od_tasks["cka_result"]
-            od_tasks["cka_result"] = None
-            cka_btn = False
-            if "error" in resp:
-                cka_fig = go.Figure()
-                cka_style = {"display": "none"}
-                cka_status = dbc.Alert(resp["error"], color="danger")
-            else:
-                matrix = resp.get("matrix", [])
-                names = resp.get("short_names", resp.get("layers", []))
-                fig = go.Figure(go.Heatmap(
-                    z=matrix, x=names, y=names, colorscale="Viridis",
-                    zmin=0, zmax=1,
-                    hovertemplate="%{y} vs %{x}<br>CKA=%{z:.3f}<extra></extra>",
-                ))
-                fig.update_layout(
-                    **plotly_layout(title=f"CKA Similarity ({resp.get('n', 0)} layers)"),
-                    height=550, yaxis={"autorange": "reversed"},
-                )
-                cka_fig = fig
-                cka_style = {"display": "block"}
-                cka_status = dbc.Badge("Done", color="success")
-
-        # ── Network state result ──
-        if not od_tasks["state_running"] and od_tasks["state_result"] is not None:
-            resp = od_tasks["state_result"]
-            od_tasks["state_result"] = None
-            st_btn = False
-            if "error" in resp:
-                st_result = dbc.Alert(resp["error"], color="danger")
-                st_status = ""
-            else:
-                layers = resp.get("layers", [])
-                total = resp.get("total_params", 0)
-                header = [html.Th("Parameter"), html.Th("Shape"), html.Th("Elements"),
-                          html.Th("Dtype"), html.Th("Sample Values")]
-                rows = []
-                for layer in layers:
-                    vals = layer.get("values", [])
-                    sample = ""
-                    if vals and isinstance(vals[0], list):
-                        flat = [v for row in vals[:3] for v in row[:5]]
-                        sample = ", ".join(f"{v:.4g}" for v in flat[:10])
-                        if len(flat) > 10:
-                            sample += ", ..."
-                    elif vals:
-                        sample = ", ".join(f"{v:.4g}" for v in vals[0][:10])
-                    rows.append(html.Tr([
-                        html.Td(html.Code(short_layer(layer["name"]))),
-                        html.Td("x".join(str(s) for s in layer.get("shape", []))),
-                        html.Td(f"{layer.get('numel', 0):,}"),
-                        html.Td(layer.get("dtype", "")),
-                        html.Td(html.Code(sample), style={"fontSize": "0.8em"}),
-                    ]))
-                st_result = html.Div([
-                    html.P(f"Total parameters: {total:,}", className="fw-semibold"),
-                    dbc.Table([html.Thead(html.Tr(header)), html.Tbody(rows)],
-                              bordered=True, hover=True, responsive=True, size="sm"),
-                ], style={"maxHeight": "600px", "overflowY": "auto"})
-                st_status = dbc.Badge("Done", color="success")
-
-        # Disable polling if nothing is running and all results consumed
-        still_running = od_tasks["heatmap_running"] or od_tasks["cka_running"] or od_tasks["state_running"]
-        has_pending = od_tasks["heatmap_result"] is not None or od_tasks["cka_result"] is not None or od_tasks["state_result"] is not None
-        disable_poll = not still_running and not has_pending
-
-        return (
-            hm_fig, hm_style, hm_status, hm_btn,
-            cka_fig, cka_style, cka_status, cka_btn,
-            st_result, st_status, st_btn,
-            disable_poll,
-        )
-
-    # ══════════════════════════════════════════════════════════════════
-    # ── Raw Data page callbacks ──────────────────────────────────────
-    # ══════════════════════════════════════════════════════════════════
-
-    @callback(
-        Output("raw-data-table", "children"),
-        Output("raw-data-count", "children"),
-        Input("raw-data-refresh-btn", "n_clicks"),
-        Input("raw-data-type", "value"),
-        Input("raw-data-limit", "value"),
-        prevent_initial_call=True,
-    )
-    def _update_raw_data(_n, data_type, limit):
-        if ipc is None:
-            return "", "No IPC channel."
-
-        reader_map = {
-            "gradient_stats": ipc.read_gradient_stats,
-            "weight_stats": ipc.read_weight_stats,
-            "activation_stats": ipc.read_activation_stats,
-            "optimizer_state": ipc.read_optimizer_state,
-            "metrics": ipc.read_metrics,
-            "predictions": ipc.read_predictions,
-            "attention": ipc.read_attention,
-        }
-        reader = reader_map.get(data_type)
-        if reader is None:
-            return "", f"Unknown data type: {data_type}"
-
-        limit = int(limit or 50)
-        total = ipc._count_events(data_type)
-        entries = reader(last_n=limit) if limit > 0 else reader()
-        if not entries:
-            return dbc.Alert("No records found.", color="secondary"), f"0 records"
-
-        # Auto-detect columns from first few entries
-        all_keys: list[str] = []
-        seen_keys: set[str] = set()
-        for e in entries[:20]:
-            for k in e:
-                if k not in seen_keys:
-                    all_keys.append(k)
-                    seen_keys.add(k)
-
-        # Skip large nested values in display
-        skip_keys = {"hist_counts", "hist_centers", "singular_values", "esd",
-                     "weights", "values", "predicted", "actual"}
-        display_keys = [k for k in all_keys if k not in skip_keys][:15]
-
-        header = [html.Th(k) for k in display_keys]
-        rows = []
-        for e in entries:
-            cells = []
-            for k in display_keys:
-                v = e.get(k)
-                if v is None:
-                    cells.append(html.Td("-", className="text-muted"))
-                elif isinstance(v, float):
-                    cells.append(html.Td(f"{v:.6g}"))
-                elif isinstance(v, list):
-                    cells.append(html.Td(f"[{len(v)} items]", className="text-muted"))
-                else:
-                    cells.append(html.Td(str(v)))
-            rows.append(html.Tr(cells))
-
-        count_text = f"{total} total records"
-        if limit > 0 and total > limit:
-            count_text += f" (showing last {limit})"
-
-        table = html.Div(
-            dbc.Table([
-                html.Thead(html.Tr(header)),
-                html.Tbody(rows),
-            ], bordered=True, hover=True, responsive=True, size="sm", striped=True),
-            style={"maxHeight": "700px", "overflowY": "auto"},
-        )
-        return table, count_text
 
     # ── Tools page refresh callback ──────────────────────────────
 

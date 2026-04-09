@@ -13,7 +13,6 @@ GradientHound integrates with weightwatcher, fvcore, torch-pruning, graphviz, an
 ## Known Limitations
 
 - **Framework assumptions** — the hook-based capture is tested primarily against standard PyTorch training loops. Custom autograd functions or compiled models (`torch.compile`) may require manual step calls.
-- **Single-machine IPC** — the training process and dashboard currently communicate via a local SQLite database; remote GPU jobs require mounting the run directory or a future socket transport.
 - **`torch.export` coverage** — FX graph export falls back to module-tree-only for models with data-dependent control flow or unsupported ops.
 - **Scale** — designed for research-scale models. Very large models (>1B parameters) may produce high-volume telemetry; use `weight_every` and `log_activations=False` to reduce write load.
 
@@ -91,11 +90,10 @@ python -m gradienthound --model model.gh.json                     # exported mod
 python -m gradienthound --model ./exports/                        # search directory for .gh.json
 python -m gradienthound --checkpoints ckpt1.pt ckpt2.pt ckpt3.pt  # checkpoint comparison
 python -m gradienthound --checkpoints ./checkpoints/              # search directory for .pt/.pth/.ckpt
-python -m gradienthound --data-dir ./run_data                     # load live IPC data
 python -m gradienthound --port 9000 --debug                       # custom port + hot-reload
 ```
 
-Combine flags freely: `--model`, `--checkpoints`, `--data-dir`, `--wandb-entity`/`--wandb-project-run-id`.
+Combine flags freely: `--model`, `--checkpoints`, `--wandb-entity`/`--wandb-project-run-id`.
 
 ---
 
@@ -123,15 +121,11 @@ Deep spectral analysis: global metric views (alpha, mp_softrank, etc.), heatmaps
 
 ### Gradient Flow
 
-Live gradient norm evolution across layers over training steps, cosine similarity between gradient steps, update ratios, dead neuron detection.
+Gradient norm evolution across layers over training steps, cosine similarity between gradient steps, update ratios, dead neuron detection.
 
 ### Metrics
 
 Time-series charts for scalars logged via wandb or directly.
-
-### On-Demand
-
-Weight heatmaps (2D matrices downsampled to 128x128), CKA similarity between all 2D layers, full network state dump (models <1M params). These are triggered from the dashboard and computed in the training process.
 
 ### Tools
 

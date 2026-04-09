@@ -81,7 +81,7 @@ def watch(
 
 
 def step(step: int | None = None) -> None:
-    """Flush buffered stats to IPC at the current or supplied training step."""
+    """Flush buffered stats at the current or supplied training step."""
     run = _get_run()
     if run is None:
         return

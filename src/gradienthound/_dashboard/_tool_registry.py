@@ -26,7 +26,7 @@ class ToolInfo:
     id: str
     name: str
     description: str
-    category: str  # "capture", "analysis", "integration", "on-demand"
+    category: str  # "analysis", "integration"
     requires: list[Requirement] = field(default_factory=list)
     check_has_data: Callable[[], bool] = lambda: False
     page: str | None = None  # link to relevant dashboard page
@@ -105,154 +105,12 @@ def _check_package(name: str) -> bool:
 def register_builtin_tools(
     registry: ToolRegistry,
     *,
-    ipc=None,
     has_checkpoints: bool = False,
     ckpt_state: dict | None = None,
     wandb_state: dict | None = None,
     model_data=None,
 ) -> None:
     """Populate the registry with GradientHound's built-in tools."""
-
-    # ── Capture tools ──────────────────────────────────────────────
-
-    registry.register(ToolInfo(
-        id="gradient_capture",
-        name="Gradient Capture",
-        description="Automatic per-layer gradient statistics via PyTorch hooks. "
-                    "Records norm, mean, std, dead percentage, and cosine similarity.",
-        category="capture",
-        requires=[
-            Requirement("PyTorch installed", lambda: _check_package("torch")),
-            Requirement("IPC channel active", lambda: ipc is not None),
-        ],
-        check_has_data=lambda: (
-            ipc is not None and bool(ipc.read_gradient_stats(last_n=1))
-        ),
-        page="/gradient-flow",
-    ))
-
-    registry.register(ToolInfo(
-        id="weight_capture",
-        name="Weight Tracking",
-        description="Periodic weight statistics capture (norm, mean, std, "
-                    "min, max, sparsity) logged every N training steps.",
-        category="capture",
-        requires=[
-            Requirement("PyTorch installed", lambda: _check_package("torch")),
-            Requirement("IPC channel active", lambda: ipc is not None),
-        ],
-        check_has_data=lambda: (
-            ipc is not None and bool(ipc.read_weight_stats(last_n=1))
-        ),
-        page="/weight-health",
-    ))
-
-    registry.register(ToolInfo(
-        id="activation_capture",
-        name="Activation Capture",
-        description="Forward-hook based activation statistics "
-                    "(mean, std, min, max, zero fraction) per layer.",
-        category="capture",
-        requires=[
-            Requirement("PyTorch installed", lambda: _check_package("torch")),
-            Requirement("IPC channel active", lambda: ipc is not None),
-        ],
-        check_has_data=lambda: (
-            ipc is not None and bool(ipc.read_activation_stats(last_n=1))
-        ),
-        page="/weight-health",
-    ))
-
-    registry.register(ToolInfo(
-        id="optimizer_tracking",
-        name="Optimizer State Tracking",
-        description="Live optimizer buffer statistics — momentum norms, "
-                    "adaptive learning-rate estimates, warmup progress.",
-        category="capture",
-        requires=[
-            Requirement("PyTorch installed", lambda: _check_package("torch")),
-            Requirement("IPC channel active", lambda: ipc is not None),
-        ],
-        check_has_data=lambda: (
-            ipc is not None and bool(ipc.read_optimizer_state(last_n=1))
-        ),
-        page="/weight-health",
-    ))
-
-    registry.register(ToolInfo(
-        id="attention_logging",
-        name="Attention Logging",
-        description="Manual attention-weight capture for transformer models. "
-                    "Visualises head-level attention matrices.",
-        category="capture",
-        requires=[
-            Requirement("PyTorch installed", lambda: _check_package("torch")),
-            Requirement("IPC channel active", lambda: ipc is not None),
-        ],
-        check_has_data=lambda: (
-            ipc is not None and bool(ipc.read_attention(last_n=1))
-        ),
-        page="/",
-    ))
-
-    registry.register(ToolInfo(
-        id="prediction_logging",
-        name="Prediction Logging",
-        description="Log predicted vs actual values for calibration analysis. "
-                    "Produces scatter plots and residual distributions.",
-        category="capture",
-        requires=[
-            Requirement("IPC channel active", lambda: ipc is not None),
-        ],
-        check_has_data=lambda: (
-            ipc is not None and bool(ipc.read_predictions(last_n=1))
-        ),
-        page="/",
-    ))
-
-    # ── On-demand tools ────────────────────────────────────────────
-
-    registry.register(ToolInfo(
-        id="weight_heatmap",
-        name="Weight Heatmap",
-        description="On-demand 2D heatmap of a layer's weight tensor. "
-                    "Requested from the dashboard, computed in the training process.",
-        category="on-demand",
-        requires=[
-            Requirement("IPC channel active", lambda: ipc is not None),
-            Requirement("Model registered", lambda: ipc is not None and bool(ipc.read_models())),
-        ],
-        check_has_data=lambda: False,  # ephemeral request/response
-        page="/on-demand",
-    ))
-
-    registry.register(ToolInfo(
-        id="cka_similarity",
-        name="CKA Similarity",
-        description="Centered Kernel Alignment between layer activations. "
-                    "Measures representational similarity across layers.",
-        category="on-demand",
-        requires=[
-            Requirement("IPC channel active", lambda: ipc is not None),
-            Requirement("Model registered", lambda: ipc is not None and bool(ipc.read_models())),
-        ],
-        check_has_data=lambda: False,
-        page="/on-demand",
-    ))
-
-    registry.register(ToolInfo(
-        id="network_state",
-        name="Network State Dump",
-        description="Full snapshot of current parameter and buffer values "
-                    "for offline inspection.",
-        category="on-demand",
-        requires=[
-            Requirement("IPC channel active", lambda: ipc is not None),
-            Requirement("Model registered", lambda: ipc is not None and bool(ipc.read_models())),
-        ],
-        check_has_data=lambda: False,
-        page="/on-demand",
-    ))
 
     # ── Analysis tools ─────────────────────────────────────────────
 
@@ -299,8 +157,7 @@ def register_builtin_tools(
             Requirement("wandb package installed", lambda: _check_package("wandb")),
         ],
         check_has_data=lambda: (
-            (ipc is not None and bool(ipc.read_metrics(last_n=1)))
-            or (wandb_state is not None and wandb_state.get("data") is not None)
+            wandb_state is not None and wandb_state.get("data") is not None
         ),
         page="/metrics",
     ))
