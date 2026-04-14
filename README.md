@@ -24,7 +24,6 @@ GradientHound integrates with weightwatcher, fvcore, torch-pruning, graphviz, an
 
 ![com](./docs/assets/comp-graph.png)
 
----
 
 ## Install
 
@@ -36,8 +35,6 @@ pip install gradienthound[spectral]  # + WeightWatcher-style spectral metrics (p
 pip install gradienthound[analysis]  # + FLOPs/pruning analysis (fvcore, torch-pruning)
 pip install gradienthound[embeddings] # + t-SNE, UMAP, PCA layer embeddings (scikit-learn, umap-learn)
 ```
-
----
 
 ## Quick Start
 
@@ -64,8 +61,6 @@ gradienthound.shutdown()
 
 **With wandb:** call `gradienthound.capture_wandb()` after `init()` to auto-capture `wandb.log()` scalars.
 
----
-
 ## API
 
 | Function | What it does |
@@ -82,8 +77,6 @@ gradienthound.shutdown()
 | `shutdown()` | Clean up hooks and close the run. |
 | `export_model(model, example_inputs, output, ...)` | Export model graph to `.gh.json` for offline viewing. |
 
----
-
 ## Standalone Dashboard
 
 ```bash
@@ -95,8 +88,6 @@ python -m gradienthound --port 9000 --debug                       # custom port 
 ```
 
 Combine flags freely: `--model`, `--checkpoints`, `--wandb-entity`/`--wandb-project-run-id`.
-
----
 
 ## Dashboard Pages
 
@@ -212,8 +203,6 @@ When optimizer state is present in checkpoints:
 - Effective learning rate estimation: `lr / (sqrt(avg_second_moment) + eps)`
 - Bias correction and warmup progress
 
----
-
 ## Model Export
 
 Export the computation graph for offline visualization (no weights saved):
@@ -232,8 +221,8 @@ The `.gh.json` contains: module tree, FX computation graph (ATen ops with shapes
 
 Falls back to module-tree-only if `torch.export` fails.
 
----
 
 ## License
 
-MIT
+MIT License. See [LICENSE](LICENSE) for details.
+
