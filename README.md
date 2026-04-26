@@ -3,7 +3,7 @@
 > **Beta** — core functionality is stable; some rough edges remain. See [Known Limitations](#known-limitations).
 
 <p align="center">
-    <img src="https://github.com/nenuadrian/GradientHound/blob/main/docs/assets/logo.png?raw=true" alt="logo" />
+    <img src="https://github.com/nenuadrian/GradientHound/blob/main/docs/assets/logo.svg?raw=true" alt="logo" />
 </p>
 
 Post-training tooling to inspect PyTorch model architectures, gradients, weights, and optimizer state in real time. Drop a few lines into any training loop and get a live Dash dashboard showing gradient flow, weight health, spectral metrics, attention patterns, and more.
