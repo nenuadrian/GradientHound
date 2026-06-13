@@ -1,6 +1,6 @@
 site_name: GradientHound
 site_description: PyTorch training telemetry and model graph inspection
-site_url: https://nenuadrian.github.io/GradientHound/
+site_url: http://gradient-hound.nenuadrian.com/
 repo_name: nenuadrian/GradientHound
 repo_url: https://github.com/nenuadrian/GradientHound
 
