@@ -8,10 +8,30 @@ version = "0.1.0"
 description = "Hook into ML training to visualize and inspect model architectures in real time"
 readme = "README.md"
 license = "MIT"
+authors = [{ name = "Adrian Mircea Nenu" }]
+keywords = ["pytorch", "machine-learning", "visualization", "training", "gradients", "telemetry"]
 requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
 dependencies = [
     "graphviz>=0.20",
 ]
+
+[project.urls]
+Homepage = "http://gradient-hound.nenuadrian.com/"
+Documentation = "http://gradient-hound.nenuadrian.com/"
+Repository = "https://github.com/nenuadrian/GradientHound"
+Issues = "https://github.com/nenuadrian/GradientHound/issues"
 
 [project.optional-dependencies]
 torch = ["torch>=2.0"]
