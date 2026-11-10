@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use GradientHound in your research, please cite it using the metadata below."
+type: software
+title: "GradientHound"
+abstract: >-
+  Post-training tooling to inspect PyTorch model architectures, gradients,
+  weights, and optimizer state in real time.
+authors:
+  - given-names: "Adrian Mircea"
+    family-names: "Nenu"
+version: 0.1.0
+date-released: 2026-06-14
+license: MIT
+repository-code: "https://github.com/nenuadrian/GradientHound"
+url: "http://gradient-hound.nenuadrian.com/"
+keywords:
+  - pytorch
+  - machine-learning
+  - visualization
+  - training
+  - gradients
+  - telemetry

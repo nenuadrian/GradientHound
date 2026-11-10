@@ -1,5 +1,9 @@
 # GradientHound
 
+[![PyPI](https://img.shields.io/pypi/v/gradienthound)](https://pypi.org/project/gradienthound/)
+[![Python](https://img.shields.io/pypi/pyversions/gradienthound)](https://pypi.org/project/gradienthound/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 > **Beta** — core functionality is stable; some rough edges remain. See [Known Limitations](#known-limitations).
 
 <p align="center">
@@ -16,13 +20,13 @@ GradientHound integrates with weightwatcher, fvcore, torch-pruning, graphviz, an
 - **`torch.export` coverage** — FX graph export falls back to module-tree-only for models with data-dependent control flow or unsupported ops.
 - **Scale** — designed for research-scale models. Very large models (>1B parameters) may produce high-volume telemetry; use `weight_every` and `log_activations=False` to reduce write load.
 
-![dash](./docs/assets/dashboard.png)
+![dash](https://github.com/nenuadrian/GradientHound/blob/main/docs/assets/dashboard.png?raw=true)
 
-![tools](./docs/assets/tools.png)
+![tools](https://github.com/nenuadrian/GradientHound/blob/main/docs/assets/tools.png?raw=true)
 
-![weightwatcher](./docs/assets/weightwatcher.png)
+![weightwatcher](https://github.com/nenuadrian/GradientHound/blob/main/docs/assets/weightwatcher.png?raw=true)
 
-![com](./docs/assets/comp-graph.png)
+![com](https://github.com/nenuadrian/GradientHound/blob/main/docs/assets/comp-graph.png?raw=true)
 
 
 ## Install
@@ -221,6 +225,20 @@ The `.gh.json` contains: module tree, FX computation graph (ATen ops with shapes
 
 Falls back to module-tree-only if `torch.export` fails.
 
+
+## Citation
+
+If you use GradientHound in your research, please cite it. Citation metadata lives in [CITATION.cff](https://github.com/nenuadrian/GradientHound/blob/main/CITATION.cff); GitHub's **"Cite this repository"** button gives APA and BibTeX formats.
+
+```bibtex
+@software{nenu_gradienthound,
+  author  = {Nenu, Adrian Mircea},
+  title   = {GradientHound},
+  year    = {2026},
+  url     = {https://github.com/nenuadrian/GradientHound},
+  license = {MIT}
+}
+```
 
 ## License
 
